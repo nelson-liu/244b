@@ -1,7 +1,9 @@
+from locust import HttpUser, task
 import requests
 import names
 import random
 from tqdm import tqdm
+import warnings
 
 rqlite_url = "http://34.223.40.95:4001"
 
@@ -12,39 +14,35 @@ requests.post(rqlite_url + "/db/execute", json=[
 ])
 
 # Send 1000 requests with varying write-read ratios
-num_requests = 1000
-write_ratio = 0.5
-num_write_requests = int(write_ratio * num_requests)
-num_read_requests = 1000 - num_write_requests
-
-# Generate entries to write
-print(f"Generating {num_write_requests} write requests")
+num_requests = 10000
 
 write_entries = []
 generated_names = []
-for i in range(num_write_requests):
+for i in range(num_requests):
     name = names.get_first_name()
     generated_names.append(name)
     write_entries.append({"name": name, "age": random.randint(1, 100)})
 
-all_requests = []
+write_requests = []
 for write_entry in write_entries:
-    all_requests.append(("write", rqlite_url + "/db/execute", [
+    write_requests.append([
         f"INSERT INTO testtable(name, age) VALUES(\"{write_entry['name']}\", {write_entry['age']})"
-    ]))
-for _ in range(num_read_requests):
+    ])
+
+read_requests = []
+for _ in range(num_requests):
     random_name = random.choice(generated_names)
-    all_requests.append(("read", rqlite_url + "/db/query", {"q": f"SELECT * FROM testtable WHERE name = {random_name}"}))
+    read_requests.append([f"SELECT * FROM testtable WHERE name = \"{random_name}\""])
 
-# Interleave the requests
-random.shuffle(all_requests)
+class UserBehavior(HttpUser):
+    @task(1)
+    def write_request(self):
+        message = random.choice(write_requests)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.client.post("/db/execute", json=message, verify=False)
 
-print("Issuing requests. Sample:")
-print(all_requests[:5])
-
-for request in tqdm(all_requests):
-    if request[0] == "write":
-        requests.post(request[1], json=request[2])
-    elif request[0] == "read":
-        requests.get(request[1], data=request[2])
-print("Done!")
+    @task(1)
+    def read_request(self):
+        message = random.choice(read_requests)
+        self.client.post("/db/query", json=message)
