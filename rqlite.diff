@@ -1,0 +1,3416 @@
+diff --git a/cluster/client.go b/cluster/client.go
+index 6059d91..4d43246 100644
+--- a/cluster/client.go
++++ b/cluster/client.go
+@@ -1,6 +1,7 @@
+ package cluster
+ 
+ import (
++	"context"
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+@@ -11,6 +12,7 @@ import (
+ 
+ 	"github.com/rqlite/rqlite/command"
+ 	"github.com/rqlite/rqlite/tcp/pool"
++	"go.opentelemetry.io/otel"
+ 	"google.golang.org/protobuf/proto"
+ )
+ 
+@@ -44,7 +46,11 @@ func NewClient(dl Dialer) *Client {
+ // SetLocal informs the client instance of the node address for the node
+ // using this client. Along with the Service instance it allows this
+ // client to serve requests for this node locally without the network hop.
+-func (c *Client) SetLocal(nodeAddr string, serv *Service) error {
++func (c *Client) SetLocal(ctx context.Context, nodeAddr string, serv *Service) error {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-cluster")
++	_, span := tr.Start(ctx, "SetLocal")
++	defer span.End()
+ 	c.lMu.Lock()
+ 	defer c.lMu.Unlock()
+ 	c.localNodeAddr = nodeAddr
+diff --git a/cluster/service_test.go b/cluster/service_test.go
+index 1ea8aad..915c543 100644
+--- a/cluster/service_test.go
++++ b/cluster/service_test.go
+@@ -1,6 +1,7 @@
+ package cluster
+ 
+ import (
++	"context"
+ 	"crypto/tls"
+ 	"net"
+ 	"os"
+@@ -96,6 +97,9 @@ func Test_NewServiceSetGetNodeAPIAddr(t *testing.T) {
+ }
+ 
+ func Test_NewServiceSetGetNodeAPIAddrLocal(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	ml := mustNewMockTransport()
+ 	s := New(ml, mustNewMockDatabase())
+ 	if s == nil {
+@@ -115,7 +119,7 @@ func Test_NewServiceSetGetNodeAPIAddrLocal(t *testing.T) {
+ 
+ 	// Test by enabling local answering
+ 	c := NewClient(ml)
+-	if err := c.SetLocal(s.Addr(), s); err != nil {
++	if err := c.SetLocal(ctx, s.Addr(), s); err != nil {
+ 		t.Fatalf("failed to set cluster client local parameters: %s", err)
+ 	}
+ 	addr, err := c.GetNodeAPIAddr(s.Addr(), 5*time.Second)
+diff --git a/cmd/rqlite/http/client.go b/cmd/rqlite/http/client.go
+index 9050320..05b569a 100644
+--- a/cmd/rqlite/http/client.go
++++ b/cmd/rqlite/http/client.go
+@@ -1,6 +1,7 @@
+ package http
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"io"
+ 	"log"
+@@ -8,6 +9,8 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"strings"
++
++	"go.opentelemetry.io/otel"
+ )
+ 
+ // ErrNoAvailableHost indicates that the client could not find an available host to send the request to.
+@@ -149,9 +152,22 @@ func (c *Client) nextHost() {
+ }
+ 
+ func (c *Client) requestFollowRedirect(method string, urlStr string, body io.Reader) (*http.Response, error) {
++	// Use the global TracerProvider.
++	// TODO(nfliu): this won't work yet because the rqlite client main doesn't have
++	// a global tracer set. Do we want to profile the client?
++	tr := otel.Tracer("cmd-rqlite-http")
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	nRedirects := 0
+ 	for {
+-		req, err := http.NewRequest(method, urlStr, body)
++		// Each execution of the run loop, we should get a new "root" span and context.
++		// TODO(nfliu): figure out how to make this nest properly
++		newCtx, span := tr.Start(ctx, "requestFollowRedirect")
++		defer span.End()
++		c.logger.Printf("In requestFollowRedirect loop")
++
++		req, err := http.NewRequestWithContext(newCtx, method, urlStr, body)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/cmd/rqlite/main.go b/cmd/rqlite/main.go
+index b66b299..aade1f9 100644
+--- a/cmd/rqlite/main.go
++++ b/cmd/rqlite/main.go
+@@ -19,6 +19,7 @@ import (
+ 	"github.com/mkideal/cli"
+ 	"github.com/rqlite/rqlite/cmd"
+ 	httpcl "github.com/rqlite/rqlite/cmd/rqlite/http"
++	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+ )
+ 
+ const maxRedirect = 21
+@@ -308,10 +309,10 @@ func getHTTPClient(argv *argT) (*http.Client, error) {
+ 		}
+ 	}
+ 
+-	client := http.Client{Transport: &http.Transport{
++	client := http.Client{Transport: otelhttp.NewTransport(&http.Transport{
+ 		TLSClientConfig: &tls.Config{InsecureSkipVerify: argv.Insecure, RootCAs: rootCAs},
+ 		Proxy:           http.ProxyFromEnvironment,
+-	}}
++	})}
+ 
+ 	// Explicitly handle redirects.
+ 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+@@ -371,10 +372,10 @@ func sendRequest(ctx *cli.Context, makeNewRequest func(string) (*http.Request, e
+ 		}
+ 	}
+ 
+-	client := http.Client{Transport: &http.Transport{
++	client := http.Client{Transport: otelhttp.NewTransport(&http.Transport{
+ 		TLSClientConfig: &tls.Config{InsecureSkipVerify: argv.Insecure, RootCAs: rootCAs},
+ 		Proxy:           http.ProxyFromEnvironment,
+-	}}
++	})}
+ 
+ 	// Explicitly handle redirects.
+ 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+@@ -459,10 +460,10 @@ func cliJSON(ctx *cli.Context, cmd, line, url string, argv *argT) error {
+ 		}
+ 	}
+ 
+-	client := http.Client{Transport: &http.Transport{
++	client := http.Client{Transport: otelhttp.NewTransport(&http.Transport{
+ 		TLSClientConfig: &tls.Config{InsecureSkipVerify: argv.Insecure},
+ 		Proxy:           http.ProxyFromEnvironment,
+-	}}
++	})}
+ 
+ 	req, err := http.NewRequest("GET", url, nil)
+ 	if err != nil {
+@@ -510,10 +511,10 @@ func cliJSON(ctx *cli.Context, cmd, line, url string, argv *argT) error {
+ 
+ func urlsToWriter(urls []string, w io.Writer, argv *argT) error {
+ 	client := http.Client{
+-		Transport: &http.Transport{
++		Transport: otelhttp.NewTransport(&http.Transport{
+ 			TLSClientConfig: &tls.Config{InsecureSkipVerify: argv.Insecure},
+ 			Proxy:           http.ProxyFromEnvironment,
+-		},
++		}),
+ 		Timeout: 10 * time.Second,
+ 	}
+ 
+diff --git a/cmd/rqlited/flags.go b/cmd/rqlited/flags.go
+index d6f5901..1b1af67 100644
+--- a/cmd/rqlited/flags.go
++++ b/cmd/rqlited/flags.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"errors"
+ 	"flag"
+ 	"fmt"
+@@ -12,6 +13,8 @@ import (
+ 	"runtime"
+ 	"strings"
+ 	"time"
++
++	"go.opentelemetry.io/otel"
+ )
+ 
+ const (
+@@ -315,7 +318,12 @@ type BuildInfo struct {
+ }
+ 
+ // ParseFlags parses the command line, and returns the configuration.
+-func ParseFlags(name, desc string, build *BuildInfo) (*Config, error) {
++func ParseFlags(ctx context.Context, name, desc string, build *BuildInfo) (*Config, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlited-flags")
++	_, span := tr.Start(ctx, "ParseFlags")
++	defer span.End()
++
+ 	if flag.Parsed() {
+ 		return nil, fmt.Errorf("command-line flags already parsed")
+ 	}
+diff --git a/cmd/rqlited/main.go b/cmd/rqlited/main.go
+index cca5935..3b9b740 100644
+--- a/cmd/rqlited/main.go
++++ b/cmd/rqlited/main.go
+@@ -2,6 +2,7 @@
+ package main
+ 
+ import (
++	"context"
+ 	"crypto/tls"
+ 	"crypto/x509"
+ 	"fmt"
+@@ -16,6 +17,14 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"go.opentelemetry.io/otel"
++	"go.opentelemetry.io/otel/attribute"
++	"go.opentelemetry.io/otel/exporters/jaeger"
++	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
++	"go.opentelemetry.io/otel/sdk/resource"
++	tracesdk "go.opentelemetry.io/otel/sdk/trace"
++	semconv "go.opentelemetry.io/otel/semconv/v1.10.0"
++
+ 	consul "github.com/rqlite/rqlite-disco-clients/consul"
+ 	"github.com/rqlite/rqlite-disco-clients/dns"
+ 	"github.com/rqlite/rqlite-disco-clients/dnssrv"
+@@ -45,6 +54,60 @@ const name = `rqlited`
+ const desc = `rqlite is a lightweight, distributed relational database, which uses SQLite as its
+ storage engine. It provides an easy-to-use, fault-tolerant store for relational data.`
+ 
++const (
++	service     = "rqlited"
++	environment = "production"
++	id          = 1
++)
++
++// tracerProvider returns an OpenTelemetry TracerProvider configured to use
++// the Jaeger exporter that will send spans to the provided url. The returned
++// TracerProvider will also use a Resource configured with all the information
++// about the application.
++func jaegerTracerProvider(url string) (*tracesdk.TracerProvider, error) {
++	// Create the Jaeger exporter
++	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(url)))
++	if err != nil {
++		return nil, err
++	}
++	tp := tracesdk.NewTracerProvider(
++		// Always be sure to batch in production.
++		tracesdk.WithBatcher(exp),
++		// Record information about this application in a Resource.
++		tracesdk.WithResource(resource.NewWithAttributes(
++			semconv.SchemaURL,
++			semconv.ServiceNameKey.String(service),
++			attribute.String("environment", environment),
++			attribute.Int64("ID", id),
++		)),
++	)
++	return tp, nil
++}
++
++func stdoutTraceProvider(w io.Writer) (*tracesdk.TracerProvider, error) {
++	// Create the Trace exporter
++	exp, err := stdouttrace.New(
++		stdouttrace.WithWriter(w),
++		// Use human-readable output.
++		stdouttrace.WithPrettyPrint(),
++	)
++	if err != nil {
++		return nil, err
++	}
++	tp := tracesdk.NewTracerProvider(
++		// Always be sure to batch in production.
++		tracesdk.WithBatcher(exp),
++		// Record information about this application in a Resource.
++		tracesdk.WithResource(resource.NewWithAttributes(
++			semconv.SchemaURL,
++			semconv.ServiceNameKey.String(service),
++			attribute.String("environment", environment),
++			attribute.Int64("ID", id),
++		)),
++	)
++	return tp, nil
++}
++
+ func init() {
+ 	log.SetFlags(log.LstdFlags)
+ 	log.SetOutput(os.Stderr)
+@@ -52,7 +115,43 @@ func init() {
+ }
+ 
+ func main() {
+-	cfg, err := ParseFlags(name, desc, &BuildInfo{
++	// use Jaeger
++	tp, err := jaegerTracerProvider("http://44.242.150.207:14268/api/traces")
++
++	// // Write to a file
++	// f, err := os.Create("traces.txt")
++	// if err != nil {
++	// 	log.Fatal(err)
++	// }
++	// defer f.Close()
++	// tp, err := stdoutTraceProvider(f)
++
++	if err != nil {
++		log.Fatal(err)
++	}
++
++	// Register our TracerProvider as the global so any imported
++	// instrumentation in the future will default to using it.
++	otel.SetTracerProvider(tp)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	// Cleanly shutdown and flush telemetry when the application exits.
++	defer func(ctx context.Context) {
++		// Do not make the application hang when it is shutdown.
++		ctx, cancel = context.WithTimeout(ctx, time.Second*5)
++		defer cancel()
++		if err := tp.Shutdown(ctx); err != nil {
++			log.Fatal(err)
++		}
++	}(ctx)
++
++	tr := tp.Tracer("rqlited-main")
++	ctx, span := tr.Start(ctx, "main")
++	defer span.End()
++
++	cfg, err := ParseFlags(ctx, name, desc, &BuildInfo{
+ 		Version: cmd.Version,
+ 		Commit:  cmd.Commit,
+ 		Branch:  cmd.Branch,
+@@ -70,14 +169,14 @@ func main() {
+ 	log.Printf("launch command: %s", strings.Join(os.Args, " "))
+ 
+ 	// Start requested profiling.
+-	startProfile(cfg.CPUProfile, cfg.MemProfile)
++	startProfile(ctx, cfg.CPUProfile, cfg.MemProfile)
+ 
+ 	// Create internode network mux and configure.
+ 	muxLn, err := net.Listen("tcp", cfg.RaftAddr)
+ 	if err != nil {
+ 		log.Fatalf("failed to listen on %s: %s", cfg.RaftAddr, err.Error())
+ 	}
+-	mux, err := startNodeMux(cfg, muxLn)
++	mux, err := startNodeMux(ctx, cfg, muxLn)
+ 	if err != nil {
+ 		log.Fatalf("failed to start node mux: %s", err.Error())
+ 	}
+@@ -85,24 +184,24 @@ func main() {
+ 	log.Printf("Raft TCP mux Listener registered with %d", cluster.MuxRaftHeader)
+ 
+ 	// Create the store.
+-	str, err := createStore(cfg, raftTn)
++	str, err := createStore(ctx, cfg, raftTn)
+ 	if err != nil {
+ 		log.Fatalf("failed to create store: %s", err.Error())
+ 	}
+ 
+ 	// Now, open store.
+-	if err := str.Open(); err != nil {
++	if err := str.Open(ctx); err != nil {
+ 		log.Fatalf("failed to open store: %s", err.Error())
+ 	}
+ 
+ 	// Get any credential store.
+-	credStr, err := credentialStore(cfg)
++	credStr, err := credentialStore(ctx, cfg)
+ 	if err != nil {
+ 		log.Fatalf("failed to get credential store: %s", err.Error())
+ 	}
+ 
+ 	// Create cluster service now, so nodes will be able to learn information about each other.
+-	clstr, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str)
++	clstr, err := clusterService(ctx, cfg, mux.Listen(cluster.MuxClusterHeader), str)
+ 	if err != nil {
+ 		log.Fatalf("failed to create cluster service: %s", err.Error())
+ 	}
+@@ -111,16 +210,16 @@ func main() {
+ 	// Start the HTTP API server.
+ 	clstrDialer := tcp.NewDialer(cluster.MuxClusterHeader, cfg.NodeEncrypt, cfg.NoNodeVerify)
+ 	clstrClient := cluster.NewClient(clstrDialer)
+-	if err := clstrClient.SetLocal(cfg.RaftAdv, clstr); err != nil {
++	if err := clstrClient.SetLocal(ctx, cfg.RaftAdv, clstr); err != nil {
+ 		log.Fatalf("failed to set cluster client local parameters: %s", err.Error())
+ 	}
+-	httpServ, err := startHTTPService(cfg, str, clstrClient, credStr)
++	httpServ, err := startHTTPService(ctx, cfg, str, clstrClient, credStr)
+ 	if err != nil {
+ 		log.Fatalf("failed to start HTTP server: %s", err.Error())
+ 	}
+ 
+ 	// Register remaining status providers.
+-	httpServ.RegisterStatus("cluster", clstr)
++	httpServ.RegisterStatus(ctx, "cluster", clstr)
+ 
+ 	tlsConfig := tls.Config{InsecureSkipVerify: cfg.NoHTTPVerify}
+ 	if cfg.X509CACert != "" {
+@@ -136,11 +235,12 @@ func main() {
+ 	}
+ 
+ 	// Create the cluster!
+-	nodes, err := str.Nodes()
++	// TODO(nfliu): instrument this?
++	nodes, err := str.Nodes(ctx)
+ 	if err != nil {
+ 		log.Fatalf("failed to get nodes %s", err.Error())
+ 	}
+-	if err := createCluster(cfg, &tlsConfig, len(nodes) > 0, str, httpServ, credStr); err != nil {
++	if err := createCluster(ctx, cfg, &tlsConfig, len(nodes) > 0, str, httpServ, credStr); err != nil {
+ 		log.Fatalf("clustering failure: %s", err.Error())
+ 	}
+ 
+@@ -162,7 +262,12 @@ func main() {
+ 	log.Println("rqlite server stopped")
+ }
+ 
+-func createStore(cfg *Config, ln *tcp.Layer) (*store.Store, error) {
++func createStore(ctx context.Context, cfg *Config, ln *tcp.Layer) (*store.Store, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlited-main")
++	_, span := tr.Start(ctx, "createStore")
++	defer span.End()
++
+ 	dataPath, err := filepath.Abs(cfg.DataPath)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to determine absolute data path: %s", err.Error())
+@@ -241,7 +346,12 @@ func createDiscoService(cfg *Config, str *store.Store) (*disco.Service, error) {
+ 	return disco.NewService(c, str), nil
+ }
+ 
+-func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credStr *auth.CredentialsStore) (*httpd.Service, error) {
++func startHTTPService(ctx context.Context, cfg *Config, str *store.Store, cltr *cluster.Client, credStr *auth.CredentialsStore) (*httpd.Service, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlited-main")
++	_, span := tr.Start(ctx, "startHTTPService")
++	defer span.End()
++
+ 	// Create HTTP server and load authentication information if required.
+ 	var s *httpd.Service
+ 	if credStr != nil {
+@@ -271,7 +381,12 @@ func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credS
+ 
+ // startNodeMux starts the TCP mux on the given listener, which should be already
+ // bound to the relevant interface.
+-func startNodeMux(cfg *Config, ln net.Listener) (*tcp.Mux, error) {
++func startNodeMux(ctx context.Context, cfg *Config, ln net.Listener) (*tcp.Mux, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlited-main")
++	_, span := tr.Start(ctx, "startNodeMux")
++	defer span.End()
++
+ 	var err error
+ 	adv := tcp.NameAddress{
+ 		Address: cfg.RaftAdv,
+@@ -293,7 +408,12 @@ func startNodeMux(cfg *Config, ln net.Listener) (*tcp.Mux, error) {
+ 	return mux, nil
+ }
+ 
+-func credentialStore(cfg *Config) (*auth.CredentialsStore, error) {
++func credentialStore(ctx context.Context, cfg *Config) (*auth.CredentialsStore, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlited-main")
++	_, span := tr.Start(ctx, "credentialStore")
++	defer span.End()
++
+ 	if cfg.AuthFile == "" {
+ 		return nil, nil
+ 	}
+@@ -310,7 +430,12 @@ func credentialStore(cfg *Config) (*auth.CredentialsStore, error) {
+ 	return cs, nil
+ }
+ 
+-func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database) (*cluster.Service, error) {
++func clusterService(ctx context.Context, cfg *Config, tn cluster.Transport, db cluster.Database) (*cluster.Service, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlited-main")
++	_, span := tr.Start(ctx, "clusterService")
++	defer span.End()
++
+ 	c := cluster.New(tn, db)
+ 	c.SetAPIAddr(cfg.HTTPAdv)
+ 	c.EnableHTTPS(cfg.X509Cert != "" && cfg.X509Key != "") // Conditions met for an HTTPS API
+@@ -321,8 +446,13 @@ func clusterService(cfg *Config, tn cluster.Transport, db cluster.Database) (*cl
+ 	return c, nil
+ }
+ 
+-func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store.Store,
++func createCluster(ctx context.Context, cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store.Store,
+ 	httpServ *httpd.Service, credStr *auth.CredentialsStore) error {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlited-main")
++	ctx, span := tr.Start(ctx, "createCluster")
++	defer span.End()
++
+ 	joins := cfg.JoinAddresses()
+ 	if joins == nil && cfg.DiscoMode == "" && !hasPeers {
+ 		// Brand new node, told to bootstrap itself. So do it.
+@@ -425,7 +555,7 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
+ 			}
+ 			bs.SetBasicAuth(cfg.JoinAs, pw)
+ 		}
+-		httpServ.RegisterStatus("disco", provider)
++		httpServ.RegisterStatus(ctx, "disco", provider)
+ 		return bs.Boot(str.ID(), cfg.RaftAdv, isClustered, cfg.BootstrapExpectTimeout)
+ 
+ 	case DiscoModeEtcdKV, DiscoModeConsulKV:
+@@ -468,7 +598,7 @@ func createCluster(cfg *Config, tlsConfig *tls.Config, hasPeers bool, str *store
+ 			log.Println("preexisting node configuration detected, not registering with discovery service")
+ 		}
+ 		go discoService.StartReporting(cfg.NodeID, cfg.HTTPURL(), cfg.RaftAdv)
+-		httpServ.RegisterStatus("disco", discoService)
++		httpServ.RegisterStatus(ctx, "disco", discoService)
+ 
+ 	default:
+ 		return fmt.Errorf("invalid disco mode %s", cfg.DiscoMode)
+diff --git a/cmd/rqlited/profile.go b/cmd/rqlited/profile.go
+index 8e596ca..d822ea3 100644
+--- a/cmd/rqlited/profile.go
++++ b/cmd/rqlited/profile.go
+@@ -1,10 +1,13 @@
+ package main
+ 
+ import (
++	"context"
+ 	"log"
+ 	"os"
+ 	"runtime"
+ 	"runtime/pprof"
++
++	"go.opentelemetry.io/otel"
+ )
+ 
+ // prof stores the file locations of active profiles.
+@@ -14,7 +17,12 @@ var prof struct {
+ }
+ 
+ // startProfile initializes the CPU and memory profile, if specified.
+-func startProfile(cpuprofile, memprofile string) {
++func startProfile(ctx context.Context, cpuprofile, memprofile string) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlited-profile")
++	_, span := tr.Start(ctx, "startProfile")
++	defer span.End()
++
+ 	if cpuprofile != "" {
+ 		f, err := os.Create(cpuprofile)
+ 		if err != nil {
+diff --git a/go.mod b/go.mod
+index d256e3f..159916d 100644
+--- a/go.mod
++++ b/go.mod
+@@ -24,6 +24,12 @@ require (
+ 	github.com/rqlite/rqlite-disco-clients v0.0.0-20220328160918-ec33ecd01491
+ 	go.etcd.io/bbolt v1.3.6
+ 	go.etcd.io/etcd/client/v3 v3.5.4 // indirect
++	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.32.0
++	go.opentelemetry.io/otel v1.7.0
++	go.opentelemetry.io/otel/exporters/jaeger v1.7.0
++	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.7.0
++	go.opentelemetry.io/otel/sdk v1.7.0
++	go.opentelemetry.io/otel/trace v1.7.0
+ 	go.uber.org/atomic v1.9.0 // indirect
+ 	go.uber.org/multierr v1.8.0 // indirect
+ 	go.uber.org/zap v1.21.0 // indirect
+@@ -35,3 +41,5 @@ require (
+ 	google.golang.org/grpc v1.46.2 // indirect
+ 	google.golang.org/protobuf v1.28.0
+ )
++
++replace github.com/hashicorp/raft => /home/nfliu/git/raft
+diff --git a/go.sum b/go.sum
+index 5cb7f83..d806702 100644
+--- a/go.sum
++++ b/go.sum
+@@ -56,6 +56,8 @@ github.com/fatih/color v1.7.0/go.mod h1:Zm6kSWBoL9eyXnKyktHP6abPY2pDugNf5Kwzbycv
+ github.com/fatih/color v1.9.0/go.mod h1:eQcE1qtQxscV5RaZvpXrrb8Drkc3/DdQ+uUYCNjL+zU=
+ github.com/fatih/color v1.13.0 h1:8LOYc1KYPPmyKMuN8QV2DNRWNbLo6LZ0iLs8+mlH53w=
+ github.com/fatih/color v1.13.0/go.mod h1:kLAiJbzzSOZDVNGyDpeOxJ47H46qBXwg5ILebYFFOfk=
++github.com/felixge/httpsnoop v1.0.2 h1:+nS9g82KMXccJ/wp0zyRW9ZBHFETmMGtkk+2CTTrW4o=
++github.com/felixge/httpsnoop v1.0.2/go.mod h1:m8KPJKqk1gH5J9DgRY2ASl2lWCfGKXixSwevea8zH2U=
+ github.com/ghodss/yaml v1.0.0/go.mod h1:4dBDuWmgqj2HViK6kFavaiC9ZROes6MMH2rRYeMEF04=
+ github.com/go-kit/kit v0.8.0/go.mod h1:xBxKIO96dXMWWy0MnWVtmwkA9/13aqxPnvrjFYMA2as=
+ github.com/go-kit/kit v0.9.0/go.mod h1:xBxKIO96dXMWWy0MnWVtmwkA9/13aqxPnvrjFYMA2as=
+@@ -63,6 +65,11 @@ github.com/go-kit/log v0.1.0/go.mod h1:zbhenjAZHb184qTLMA9ZjW7ThYL0H2mk7Q6pNt4vb
+ github.com/go-logfmt/logfmt v0.3.0/go.mod h1:Qt1PoO58o5twSAckw1HlFXLmHsOX5/0LbT9GBnD5lWE=
+ github.com/go-logfmt/logfmt v0.4.0/go.mod h1:3RMwSq7FuexP4Kalkev3ejPJsZTpXXBr9+V4qmtdjCk=
+ github.com/go-logfmt/logfmt v0.5.0/go.mod h1:wCYkCAKZfumFQihp8CzCvQ3paCTfi41vtzG1KdI/P7A=
++github.com/go-logr/logr v1.2.2/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
++github.com/go-logr/logr v1.2.3 h1:2DntVwHkVopvECVRSlL5PSo9eG+cAkDCuckLubN+rq0=
++github.com/go-logr/logr v1.2.3/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
++github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
++github.com/go-logr/stdr v1.2.2/go.mod h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=
+ github.com/go-stack/stack v1.8.0/go.mod h1:v0f6uXyyMGvRgIKkXu+yp6POWl0qKG85gN/melR3HDY=
+ github.com/godbus/dbus/v5 v5.0.4/go.mod h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA=
+ github.com/gogo/protobuf v1.1.1/go.mod h1:r8qH/GZQm5c6nD/R0oafs1akxWv10x8SbQlK7atdtwQ=
+@@ -94,8 +101,9 @@ github.com/google/go-cmp v0.4.0/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/
+ github.com/google/go-cmp v0.5.0/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
+ github.com/google/go-cmp v0.5.4/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
+ github.com/google/go-cmp v0.5.5/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
+-github.com/google/go-cmp v0.5.6 h1:BKbKCqvP6I+rmFHt06ZmyQtvB8xAkWdhFyr0ZUNZcxQ=
+ github.com/google/go-cmp v0.5.6/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
++github.com/google/go-cmp v0.5.7 h1:81/ik6ipDQS2aGcBfIN5dHDB36BwrStyeAQquSYCV4o=
++github.com/google/go-cmp v0.5.7/go.mod h1:n+brtR0CgQNWTVd5ZUFpTBC8YFBDLK/h/bpaJ8/DtOE=
+ github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
+ github.com/google/uuid v1.1.2/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+ github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0/go.mod h1:8NvIoxWQoOIhqOTXgfV/d3M/q6VIi02HzZEHgUlZvzk=
+@@ -245,8 +253,6 @@ github.com/prometheus/procfs v0.0.8/go.mod h1:7Qr8sr6344vo1JqZ6HhLceV9o3AJ1Ff+Gx
+ github.com/prometheus/procfs v0.1.3/go.mod h1:lV6e/gmhEcM9IjHGsFOCxxuZ+z1YqCvr4OA4YeYWdaU=
+ github.com/prometheus/procfs v0.6.0/go.mod h1:cz+aTbrPOrUb4q7XlbU9ygM+/jj0fzG6c1xBZuNvfVA=
+ github.com/rogpeppe/fastuuid v1.2.0/go.mod h1:jVj6XXZzXRy/MSR5jhDC/2q6DgLz+nrA6LYCDYWNEvQ=
+-github.com/rqlite/go-sqlite3 v1.24.0 h1:5XeeAK0hTgtRZJ5jtuHuTBtrZm3FKerZYnsd3DcVfMw=
+-github.com/rqlite/go-sqlite3 v1.24.0/go.mod h1:ml55MVv28UP7V8zrxILd2EsrI6Wfsz76YSskpg08Ut4=
+ github.com/rqlite/go-sqlite3 v1.25.0 h1:dAQfUg5Ym3c0bRdV2MunwB/+l4SmGUw1NkJJoN1oFZ8=
+ github.com/rqlite/go-sqlite3 v1.25.0/go.mod h1:ml55MVv28UP7V8zrxILd2EsrI6Wfsz76YSskpg08Ut4=
+ github.com/rqlite/raft-boltdb v0.0.0-20211018013422-771de01086ce h1:sVlzmCJiaM0LGK3blAHOD/43QxJZ8bLCDcsqZRatnFE=
+@@ -266,8 +272,9 @@ github.com/stretchr/testify v1.2.2/go.mod h1:a8OnRcib4nhh0OaRAV+Yts87kKdq0PP7pXf
+ github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
+ github.com/stretchr/testify v1.4.0/go.mod h1:j7eGeouHqKxXV5pUuKE4zz7dFj8WfuZ+81PSLYec5m4=
+ github.com/stretchr/testify v1.5.1/go.mod h1:5W2xD1RspED5o8YsWQXVCued0rvSQ+mT+I5cxcmMvtA=
+-github.com/stretchr/testify v1.7.0 h1:nwc3DEeHmmLAfoZucVR881uASk0Mfjw8xYJ99tb5CcY=
+ github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
++github.com/stretchr/testify v1.7.1 h1:5TQK59W5E3v0r2duFAb7P95B6hEeOyEnHRa8MjYSMTY=
++github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+ github.com/tv42/httpunix v0.0.0-20150427012821-b75d8614f926/go.mod h1:9ESjWnEqriFuLhtthL60Sar/7RFoluCcXsuvEwTV5KM=
+ github.com/valyala/bytebufferpool v1.0.0/go.mod h1:6bBcMArwyJ5K/AmCkWv1jt77kVWyCJ6HpOuEn7z0Csc=
+ github.com/valyala/fasttemplate v1.0.1/go.mod h1:UQGH1tvbgY+Nz5t2n7tXsz52dQxojPUpymEIMZ47gx8=
+@@ -287,6 +294,20 @@ go.etcd.io/etcd/client/pkg/v3 v3.5.4/go.mod h1:IJHfcCEKxYu1Os13ZdwCwIUTUVGYTSAM3
+ go.etcd.io/etcd/client/v3 v3.5.1/go.mod h1:OnjH4M8OnAotwaB2l9bVgZzRFKru7/ZMoS46OtKyd3Q=
+ go.etcd.io/etcd/client/v3 v3.5.4 h1:p83BUL3tAYS0OT/r0qglgc3M1JjhM0diV8DSWAhVXv4=
+ go.etcd.io/etcd/client/v3 v3.5.4/go.mod h1:ZaRkVgBZC+L+dLCjTcF1hRXpgZXQPOvnA/Ak/gq3kiY=
++go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.32.0 h1:mac9BKRqwaX6zxHPDe3pvmWpwuuIM0vuXv2juCnQevE=
++go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.32.0/go.mod h1:5eCOqeGphOyz6TsY3ZDNjE33SM/TFAK3RGuCL2naTgY=
++go.opentelemetry.io/otel v1.7.0 h1:Z2lA3Tdch0iDcrhJXDIlC94XE+bxok1F9B+4Lz/lGsM=
++go.opentelemetry.io/otel v1.7.0/go.mod h1:5BdUoMIz5WEs0vt0CUEMtSSaTSHBBVwrhnz7+nrD5xk=
++go.opentelemetry.io/otel/exporters/jaeger v1.7.0 h1:wXgjiRldljksZkZrldGVe6XrG9u3kYDyQmkZwmm5dI0=
++go.opentelemetry.io/otel/exporters/jaeger v1.7.0/go.mod h1:PwQAOqBgqbLQRKlj466DuD2qyMjbtcPpfPfj+AqbSBs=
++go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.7.0 h1:8hPcgCg0rUJiKE6VWahRvjgLUrNl7rW2hffUEPKXVEM=
++go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.7.0/go.mod h1:K4GDXPY6TjUiwbOh+DkKaEdCF8y+lvMoM6SeAPyfCCM=
++go.opentelemetry.io/otel/metric v0.30.0 h1:Hs8eQZ8aQgs0U49diZoaS6Uaxw3+bBE3lcMUKBFIk3c=
++go.opentelemetry.io/otel/metric v0.30.0/go.mod h1:/ShZ7+TS4dHzDFmfi1kSXMhMVubNoP0oIaBp70J6UXU=
++go.opentelemetry.io/otel/sdk v1.7.0 h1:4OmStpcKVOfvDOgCt7UriAPtKolwIhxpnSNI/yK+1B0=
++go.opentelemetry.io/otel/sdk v1.7.0/go.mod h1:uTEOTwaqIVuTGiJN7ii13Ibp75wJmYUDe374q6cZwUU=
++go.opentelemetry.io/otel/trace v1.7.0 h1:O37Iogk1lEkMRXewVtZ1BBTVn5JEp8GrJvP92bJqC6o=
++go.opentelemetry.io/otel/trace v1.7.0/go.mod h1:fzLSB9nqR2eXzxPXb2JW9IKE+ScyXA48yyE4TNvoHqU=
+ go.opentelemetry.io/proto/otlp v0.7.0/go.mod h1:PqfVotwruBrMGOCsRd/89rSnXhoiJIqeYNgFYFoEGnI=
+ go.uber.org/atomic v1.7.0/go.mod h1:fEN4uk6kAWBTFdckzkM89CLk9XfWZrxpCo0nPH17wJc=
+ go.uber.org/atomic v1.9.0 h1:ECmE8Bn/WFTYwEW/bpKD3M8VtR/zQVbavAoalC1PYyE=
+@@ -381,6 +402,7 @@ golang.org/x/sys v0.0.0-20210303074136-134d130e1a04/go.mod h1:h1NjWce9XRLGQEsW7w
+ golang.org/x/sys v0.0.0-20210330210617-4fbd30eecc44/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20210403161142-5e06dd20ab57/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20210423082822-04245dca01da/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
++golang.org/x/sys v0.0.0-20210423185535-09eb48e85fd7/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20210510120138-977fb7262007/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20210603081109-ebe580a85c40/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.0.0-20210615035016-665e8c7367d1/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+diff --git a/http/service.go b/http/service.go
+index eac331f..0813f10 100644
+--- a/http/service.go
++++ b/http/service.go
+@@ -3,6 +3,7 @@
+ package http
+ 
+ import (
++	"context"
+ 	"crypto/tls"
+ 	"crypto/x509"
+ 	"encoding/json"
+@@ -27,6 +28,7 @@ import (
+ 	"github.com/rqlite/rqlite/command/encoding"
+ 	"github.com/rqlite/rqlite/queue"
+ 	"github.com/rqlite/rqlite/store"
++	"go.opentelemetry.io/otel"
+ )
+ 
+ var (
+@@ -76,7 +78,7 @@ type Store interface {
+ 	Stats() (map[string]interface{}, error)
+ 
+ 	// Nodes returns the slice of store.Servers in the cluster
+-	Nodes() ([]*store.Server, error)
++	Nodes(ctx context.Context) ([]*store.Server, error)
+ 
+ 	// Backup wites backup of the node state to dst
+ 	Backup(leader bool, f store.BackupFormat, dst io.Writer) error
+@@ -349,6 +351,14 @@ func (s *Service) HTTPS() bool {
+ 
+ // ServeHTTP allows Service to serve HTTP requests.
+ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	tp := otel.Tracer("rqlite-http")
++	// Create new context for processing this request
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	ctx, span := tp.Start(ctx, "ServeHTTP")
++	defer span.End()
++
+ 	s.addBuildVersion(w)
+ 
+ 	switch {
+@@ -356,32 +366,32 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		http.Redirect(w, r, "/status", http.StatusFound)
+ 	case strings.HasPrefix(r.URL.Path, "/db/execute"):
+ 		stats.Add(numExecutions, 1)
+-		s.handleExecute(w, r)
++		s.handleExecute(ctx, w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/db/query"):
+ 		stats.Add(numQueries, 1)
+-		s.handleQuery(w, r)
++		s.handleQuery(ctx, w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/db/backup"):
+ 		stats.Add(numBackups, 1)
+-		s.handleBackup(w, r)
++		s.handleBackup(ctx, w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/db/load"):
+ 		stats.Add(numLoad, 1)
+-		s.handleLoad(w, r)
++		s.handleLoad(ctx, w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/join"):
+ 		stats.Add(numJoins, 1)
+-		s.handleJoin(w, r)
++		s.handleJoin(ctx, w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/notify"):
+ 		stats.Add(numNotifies, 1)
+-		s.handleNotify(w, r)
++		s.handleNotify(ctx, w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/remove"):
+-		s.handleRemove(w, r)
++		s.handleRemove(ctx, w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/status"):
+ 		stats.Add(numStatus, 1)
+-		s.handleStatus(w, r)
++		s.handleStatus(ctx, w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/nodes"):
+-		s.handleNodes(w, r)
++		s.handleNodes(ctx, w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/readyz"):
+ 		stats.Add(numReadyz, 1)
+-		s.handleReadyz(w, r)
++		s.handleReadyz(ctx, w, r)
+ 	case r.URL.Path == "/debug/vars" && s.Expvar:
+ 		s.handleExpvar(w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/debug/pprof") && s.Pprof:
+@@ -392,7 +402,12 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ // RegisterStatus allows other modules to register status for serving over HTTP.
+-func (s *Service) RegisterStatus(key string, stat StatusReporter) error {
++func (s *Service) RegisterStatus(ctx context.Context, key string, stat StatusReporter) error {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-http")
++	_, span := tr.Start(ctx, "RegisterStatus")
++	defer span.End()
++
+ 	s.statusMu.Lock()
+ 	defer s.statusMu.Unlock()
+ 
+@@ -405,7 +420,11 @@ func (s *Service) RegisterStatus(key string, stat StatusReporter) error {
+ }
+ 
+ // handleJoin handles cluster-join requests from other nodes.
+-func (s *Service) handleJoin(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleJoin(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	_, span := tr.Start(ctx, "handleJoini")
++	defer span.End()
++
+ 	if !s.CheckRequestPerm(r, PermJoin) {
+ 		w.WriteHeader(http.StatusUnauthorized)
+ 		return
+@@ -464,7 +483,11 @@ func (s *Service) handleJoin(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ // handleNotify handles node-notify requests from other nodes.
+-func (s *Service) handleNotify(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleNotify(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	_, span := tr.Start(ctx, "handleNotify")
++	defer span.End()
++
+ 	if !s.CheckRequestPerm(r, PermJoin) {
+ 		w.WriteHeader(http.StatusUnauthorized)
+ 		return
+@@ -504,7 +527,11 @@ func (s *Service) handleNotify(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ // handleRemove handles cluster-remove requests.
+-func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleRemove(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	_, span := tr.Start(ctx, "handleRemove")
++	defer span.End()
++
+ 	if !s.CheckRequestPerm(r, PermRemove) {
+ 		w.WriteHeader(http.StatusUnauthorized)
+ 		return
+@@ -557,7 +584,11 @@ func (s *Service) handleRemove(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ // handleBackup returns the consistent database snapshot.
+-func (s *Service) handleBackup(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleBackup(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	_, span := tr.Start(ctx, "handleBackup")
++	defer span.End()
++
+ 	if !s.CheckRequestPerm(r, PermBackup) {
+ 		w.WriteHeader(http.StatusUnauthorized)
+ 		return
+@@ -603,7 +634,11 @@ func (s *Service) handleBackup(w http.ResponseWriter, r *http.Request) {
+ 
+ // handleLoad loads the state contained in a .dump output. This API is different
+ // from others in that it expects a raw file, not wrapped in any kind of JSON.
+-func (s *Service) handleLoad(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleLoad(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	_, span := tr.Start(ctx, "handleLoad")
++	defer span.End()
++
+ 	if !s.CheckRequestPerm(r, PermLoad) {
+ 		w.WriteHeader(http.StatusUnauthorized)
+ 		return
+@@ -668,7 +703,11 @@ func (s *Service) handleLoad(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ // handleStatus returns status on the system.
+-func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleStatus(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	_, span := tr.Start(ctx, "handleStatus")
++	defer span.End()
++
+ 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+ 
+ 	if !s.CheckRequestPerm(r, PermStatus) {
+@@ -793,7 +832,11 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
+ // handleNodes returns status on the other voting nodes in the system.
+ // This attempts to contact all the nodes in the cluster, so may take
+ // some time to return.
+-func (s *Service) handleNodes(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleNodes(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	newCtx, span := tr.Start(ctx, "handleNodes")
++	defer span.End()
++
+ 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+ 
+ 	if !s.CheckRequestPerm(r, PermStatus) {
+@@ -819,7 +862,7 @@ func (s *Service) handleNodes(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// Get nodes in the cluster, and possibly filter out non-voters.
+-	nodes, err := s.store.Nodes()
++	nodes, err := s.store.Nodes(newCtx)
+ 	if err != nil {
+ 		http.Error(w, fmt.Sprintf("store nodes: %s", err.Error()),
+ 			http.StatusInternalServerError)
+@@ -887,7 +930,11 @@ func (s *Service) handleNodes(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ // handleReadyz returns whether the node is ready.
+-func (s *Service) handleReadyz(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleReadyz(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	_, span := tr.Start(ctx, "handleReadyz")
++	defer span.End()
++
+ 	if !s.CheckRequestPerm(r, PermReady) {
+ 		w.WriteHeader(http.StatusUnauthorized)
+ 		return
+@@ -938,7 +985,11 @@ func (s *Service) handleReadyz(w http.ResponseWriter, r *http.Request) {
+ 	w.Write([]byte("[+]node ok\n[+]leader does not exist"))
+ }
+ 
+-func (s *Service) handleExecute(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleExecute(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	ctx, span := tr.Start(ctx, "handleExecute")
++	defer span.End()
++
+ 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+ 
+ 	if !s.CheckRequestPerm(r, PermExecute) {
+@@ -959,14 +1010,19 @@ func (s *Service) handleExecute(w http.ResponseWriter, r *http.Request) {
+ 
+ 	if queue {
+ 		stats.Add(numQueuedExecutions, 1)
+-		s.queuedExecute(w, r)
++		s.queuedExecute(ctx, w, r)
+ 	} else {
+-		s.execute(w, r)
++		s.execute(ctx, w, r)
+ 	}
+ }
+ 
+ // queuedExecute handles queued queries that modify the database.
+-func (s *Service) queuedExecute(w http.ResponseWriter, r *http.Request) {
++func (s *Service) queuedExecute(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	ctx, span := tr.Start(ctx, "queuedExecute")
++	defer span.End()
++	//TODO(nfliu): profile children here?
++
+ 	// Perform a leader check, unless disabled. This prevents generating queued writes on
+ 	// a node that does not appear to be connected to a cluster (even a single-node cluster).
+ 	noLeader, err := noLeader(r)
+@@ -1009,7 +1065,12 @@ func (s *Service) queuedExecute(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ // execute handles queries that modify the database.
+-func (s *Service) execute(w http.ResponseWriter, r *http.Request) {
++func (s *Service) execute(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	ctx, span := tr.Start(ctx, "execute")
++	defer span.End()
++	//TODO(nfliu): profile children here
++
+ 	resp := NewResponse()
+ 
+ 	timeout, isTx, timings, redirect, err := reqParams(r, defaultTimeout)
+@@ -1079,7 +1140,11 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request) {
+ }
+ 
+ // handleQuery handles queries that do not modify the database.
+-func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request) {
++func (s *Service) handleQuery(ctx context.Context, w http.ResponseWriter, r *http.Request) {
++	tr := otel.Tracer("rqlite-http")
++	_, span := tr.Start(ctx, "handleQuery")
++	defer span.End()
++
+ 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+ 
+ 	if !s.CheckRequestPerm(r, PermQuery) {
+diff --git a/http/service_test.go b/http/service_test.go
+index 9cf8889..e942426 100644
+--- a/http/service_test.go
++++ b/http/service_test.go
+@@ -1,6 +1,7 @@
+ package http
+ 
+ import (
++	"context"
+ 	"crypto/tls"
+ 	"encoding/json"
+ 	"fmt"
+@@ -693,17 +694,20 @@ func Test_BackupFlagsNoLeaderOK(t *testing.T) {
+ }
+ 
+ func Test_RegisterStatus(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	var stats *mockStatusReporter
+ 	m := &MockStore{}
+ 	c := &mockClusterService{}
+ 
+ 	s := New("127.0.0.1:0", m, c, nil)
+ 
+-	if err := s.RegisterStatus("foo", stats); err != nil {
++	if err := s.RegisterStatus(ctx, "foo", stats); err != nil {
+ 		t.Fatalf("failed to register statusReporter: %s", err.Error())
+ 	}
+ 
+-	if err := s.RegisterStatus("foo", stats); err == nil {
++	if err := s.RegisterStatus(ctx, "foo", stats); err == nil {
+ 		t.Fatal("successfully re-registered statusReporter")
+ 	}
+ }
+@@ -1092,7 +1096,7 @@ func (m *MockStore) Stats() (map[string]interface{}, error) {
+ 	return nil, nil
+ }
+ 
+-func (m *MockStore) Nodes() ([]*store.Server, error) {
++func (m *MockStore) Nodes(ctx context.Context) ([]*store.Server, error) {
+ 	return nil, nil
+ }
+ 
+diff --git a/store/store.go b/store/store.go
+index e283ece..5ba619d 100644
+--- a/store/store.go
++++ b/store/store.go
+@@ -6,6 +6,7 @@ package store
+ import (
+ 	"bytes"
+ 	"compress/gzip"
++	"context"
+ 	"encoding/binary"
+ 	"errors"
+ 	"expvar"
+@@ -26,6 +27,7 @@ import (
+ 	"github.com/rqlite/rqlite/command"
+ 	sql "github.com/rqlite/rqlite/db"
+ 	rlog "github.com/rqlite/rqlite/log"
++	"go.opentelemetry.io/otel"
+ )
+ 
+ var (
+@@ -258,7 +260,12 @@ func New(ln Listener, c *Config) *Store {
+ }
+ 
+ // Open opens the Store.
+-func (s *Store) Open() (retErr error) {
++func (s *Store) Open(ctx context.Context) (retErr error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-store")
++	_, span := tr.Start(ctx, "Open")
++	defer span.End()
++
+ 	defer func() {
+ 		if retErr == nil {
+ 			s.open = true
+@@ -443,36 +450,56 @@ func (s *Store) Close(wait bool) (retErr error) {
+ 
+ // WaitForAppliedFSM waits until the currently applied logs (at the time this
+ // function is called) are actually reflected by the FSM, or the timeout expires.
+-func (s *Store) WaitForAppliedFSM(timeout time.Duration) (uint64, error) {
++func (s *Store) WaitForAppliedFSM(ctx context.Context, timeout time.Duration) (uint64, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-store")
++	ctx, span := tr.Start(ctx, "WaitForAppliedFSM")
++	defer span.End()
++
+ 	if timeout == 0 {
+ 		return 0, nil
+ 	}
+-	return s.WaitForFSMIndex(s.raft.AppliedIndex(), timeout)
++	return s.WaitForFSMIndex(ctx, s.raft.AppliedIndex(), timeout)
+ }
+ 
+ // WaitForInitialLogs waits for logs that were in the Store at time of open
+ // to be applied to the state machine.
+-func (s *Store) WaitForInitialLogs(timeout time.Duration) error {
++func (s *Store) WaitForInitialLogs(ctx context.Context, timeout time.Duration) error {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-store")
++	ctx, span := tr.Start(ctx, "WaitForInitialLogs")
++	defer span.End()
++
+ 	if timeout == 0 {
+ 		return nil
+ 	}
+ 	s.logger.Printf("waiting for up to %s for application of initial logs (lcIdx=%d)",
+ 		timeout, s.lastCommandIdxOnOpen)
+-	return s.WaitForApplied(timeout)
++	return s.WaitForApplied(ctx, timeout)
+ }
+ 
+ // WaitForApplied waits for all Raft log entries to be applied to the
+ // underlying database.
+-func (s *Store) WaitForApplied(timeout time.Duration) error {
++func (s *Store) WaitForApplied(ctx context.Context, timeout time.Duration) error {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-store")
++	ctx, span := tr.Start(ctx, "WaitForApplied")
++	defer span.End()
++
+ 	if timeout == 0 {
+ 		return nil
+ 	}
+-	return s.WaitForAppliedIndex(s.raft.LastIndex(), timeout)
++	return s.WaitForAppliedIndex(ctx, s.raft.LastIndex(), timeout)
+ }
+ 
+ // WaitForAppliedIndex blocks until a given log index has been applied,
+ // or the timeout expires.
+-func (s *Store) WaitForAppliedIndex(idx uint64, timeout time.Duration) error {
++func (s *Store) WaitForAppliedIndex(ctx context.Context, idx uint64, timeout time.Duration) error {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-store")
++	ctx, span := tr.Start(ctx, "WaitForAppliedIndex")
++	defer span.End()
++
+ 	tck := time.NewTicker(appliedWaitDelay)
+ 	defer tck.Stop()
+ 	tmr := time.NewTimer(timeout)
+@@ -555,7 +582,11 @@ func (s *Store) LeaderID() (string, error) {
+ }
+ 
+ // Nodes returns the slice of nodes in the cluster, sorted by ID ascending.
+-func (s *Store) Nodes() ([]*Server, error) {
++func (s *Store) Nodes(ctx context.Context) ([]*Server, error) {
++	tr := otel.Tracer("rqlite-store")
++	_, span := tr.Start(ctx, "Nodes")
++	defer span.End()
++
+ 	f := s.raft.GetConfiguration()
+ 	if f.Error() != nil {
+ 		return nil, f.Error()
+@@ -576,7 +607,12 @@ func (s *Store) Nodes() ([]*Server, error) {
+ }
+ 
+ // WaitForLeader blocks until a leader is detected, or the timeout expires.
+-func (s *Store) WaitForLeader(timeout time.Duration) (string, error) {
++func (s *Store) WaitForLeader(ctx context.Context, timeout time.Duration) (string, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-store")
++	_, span := tr.Start(ctx, "WaitForLeader")
++	defer span.End()
++
+ 	tck := time.NewTicker(leaderWaitDelay)
+ 	defer tck.Stop()
+ 	tmr := time.NewTimer(timeout)
+@@ -607,7 +643,12 @@ func (s *Store) SetRequestCompression(batch, size int) {
+ 
+ // WaitForFSMIndex blocks until a given log index has been applied to the
+ // state machine or the timeout expires.
+-func (s *Store) WaitForFSMIndex(idx uint64, timeout time.Duration) (uint64, error) {
++func (s *Store) WaitForFSMIndex(ctx context.Context, idx uint64, timeout time.Duration) (uint64, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-store")
++	ctx, span := tr.Start(ctx, "WaitForFSMIndex")
++	defer span.End()
++
+ 	tck := time.NewTicker(appliedWaitDelay)
+ 	defer tck.Stop()
+ 	tmr := time.NewTimer(timeout)
+@@ -631,6 +672,10 @@ func (s *Store) WaitForFSMIndex(idx uint64, timeout time.Duration) (uint64, erro
+ 
+ // Stats returns stats for the store.
+ func (s *Store) Stats() (map[string]interface{}, error) {
++	// TODO(nfliu): bubble this up
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	fsmIdx := func() uint64 {
+ 		s.fsmIndexMu.RLock()
+ 		defer s.fsmIndexMu.RUnlock()
+@@ -646,7 +691,7 @@ func (s *Store) Stats() (map[string]interface{}, error) {
+ 		return nil, err
+ 	}
+ 
+-	nodes, err := s.Nodes()
++	nodes, err := s.Nodes(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/store/store_restart_test.go b/store/store_restart_test.go
+index b8c0b16..c97e034 100644
+--- a/store/store_restart_test.go
++++ b/store/store_restart_test.go
+@@ -1,6 +1,7 @@
+ package store
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"os"
+ 	"testing"
+@@ -10,13 +11,16 @@ import (
+ )
+ 
+ func openStoreCloseStartup(t *testing.T, s *Store) {
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 	er := executeRequestFromStrings([]string{
+@@ -28,7 +32,7 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
+ 		t.Fatalf("failed to execute on single node: %s", err.Error())
+ 	}
+ 
+-	fsmIdx, err := s.WaitForAppliedFSM(5 * time.Second)
++	fsmIdx, err := s.WaitForAppliedFSM(ctx, 5*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("failed to wait for fsmIndex: %s", err.Error())
+ 	}
+@@ -38,16 +42,16 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
+ 	}
+ 
+ 	// Reopen it and confirm data still there.
+-	if err := s.Open(); err != nil {
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+ 	// Wait until the log entries have been applied to the voting follower,
+ 	// and then query.
+-	if _, err := s.WaitForFSMIndex(fsmIdx, 5*time.Second); err != nil {
++	if _, err := s.WaitForFSMIndex(ctx, fsmIdx, 5*time.Second); err != nil {
+ 		t.Fatalf("error waiting for follower to apply index: %s:", err.Error())
+ 	}
+ 
+@@ -71,10 +75,10 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
+ 	// Tweak snapshot params to force a snap to take place.
+ 	s.SnapshotThreshold = 4
+ 	s.SnapshotInterval = 100 * time.Millisecond
+-	if err := s.Open(); err != nil {
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -114,7 +118,7 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
+ 		}
+ 	}
+ 
+-	fsmIdx, err = s.WaitForAppliedFSM(5 * time.Second)
++	fsmIdx, err = s.WaitForAppliedFSM(ctx, 5*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("failed to wait for fsmIndex: %s", err.Error())
+ 	}
+@@ -123,16 +127,16 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
+ 	if err := s.Close(true); err != nil {
+ 		t.Fatalf("failed to close single-node store: %s", err.Error())
+ 	}
+-	if err := s.Open(); err != nil {
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+ 	// Wait until the log entries have been applied to the voting follower,
+ 	// and then query.
+-	if _, err := s.WaitForFSMIndex(fsmIdx, 5*time.Second); err != nil {
++	if _, err := s.WaitForFSMIndex(ctx, fsmIdx, 5*time.Second); err != nil {
+ 		t.Fatalf("error waiting for follower to apply index: %s:", err.Error())
+ 	}
+ 
+@@ -155,10 +159,10 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
+ 	s.SnapshotThreshold = 8192
+ 	s.SnapshotInterval = 100 * time.Second
+ 
+-	if err := s.Open(); err != nil {
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 	_, err = s.Execute(executeRequestFromString(`INSERT INTO foo(name) VALUES("fiona")`, false, false))
+@@ -174,7 +178,7 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
+ 		t.Fatalf("unexpected results for query\nexp: %s\ngot: %s", exp, got)
+ 	}
+ 
+-	fsmIdx, err = s.WaitForAppliedFSM(5 * time.Second)
++	fsmIdx, err = s.WaitForAppliedFSM(ctx, 5*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("failed to wait for fsmIndex: %s", err.Error())
+ 	}
+@@ -182,16 +186,16 @@ func openStoreCloseStartup(t *testing.T, s *Store) {
+ 	if err := s.Close(true); err != nil {
+ 		t.Fatalf("failed to close single-node store: %s", err.Error())
+ 	}
+-	if err := s.Open(); err != nil {
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+ 	// Wait until the log entries have been applied to the voting follower,
+ 	// and then query.
+-	if _, err := s.WaitForFSMIndex(fsmIdx, 5*time.Second); err != nil {
++	if _, err := s.WaitForFSMIndex(ctx, fsmIdx, 5*time.Second); err != nil {
+ 		t.Fatalf("error waiting for follower to apply index: %s:", err.Error())
+ 	}
+ 
+diff --git a/store/store_test.go b/store/store_test.go
+index c772e52..1a3d560 100644
+--- a/store/store_test.go
++++ b/store/store_test.go
+@@ -2,6 +2,7 @@ package store
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"io/ioutil"
+@@ -28,14 +29,17 @@ func Test_OpenStoreSingleNode(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 
+-	_, err := s.WaitForLeader(10 * time.Second)
++	_, err := s.WaitForLeader(ctx, 10*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+@@ -57,7 +61,10 @@ func Test_OpenStoreCloseSingleNode(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if !s.open {
+@@ -67,7 +74,7 @@ func Test_OpenStoreCloseSingleNode(t *testing.T) {
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 	er := executeRequestFromStrings([]string{
+@@ -79,7 +86,7 @@ func Test_OpenStoreCloseSingleNode(t *testing.T) {
+ 		t.Fatalf("failed to execute on single node: %s", err.Error())
+ 	}
+ 
+-	fsmIdx, err := s.WaitForAppliedFSM(5 * time.Second)
++	fsmIdx, err := s.WaitForAppliedFSM(ctx, 5*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("failed to wait for fsmIndex: %s", err.Error())
+ 	}
+@@ -92,16 +99,16 @@ func Test_OpenStoreCloseSingleNode(t *testing.T) {
+ 	}
+ 
+ 	// Reopen it and confirm data still there.
+-	if err := s.Open(); err != nil {
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+ 	// Wait until the log entries have been applied to the voting follower,
+ 	// and then query.
+-	if _, err := s.WaitForFSMIndex(fsmIdx, 5*time.Second); err != nil {
++	if _, err := s.WaitForFSMIndex(ctx, fsmIdx, 5*time.Second); err != nil {
+ 		t.Fatalf("error waiting for follower to apply index: %s:", err.Error())
+ 	}
+ 
+@@ -128,7 +135,10 @@ func Test_StoreLeaderObservation(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 
+@@ -170,14 +180,17 @@ func Test_SingleNodeInMemExecuteQuery(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	_, err := s.WaitForLeader(10 * time.Second)
++	_, err := s.WaitForLeader(ctx, 10*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+@@ -211,14 +224,17 @@ func Test_SingleNodeInMemExecuteQueryFail(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -239,14 +255,17 @@ func Test_SingleNodeFileExecuteQuery(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -317,14 +336,17 @@ func Test_SingleNodeExecuteQueryTx(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -371,14 +393,17 @@ func Test_SingleNodeInMemFK(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -404,14 +429,17 @@ func Test_SingleNodeSQLitePath(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -450,14 +478,17 @@ func Test_SingleNodeBackupBinary(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -504,14 +535,17 @@ func Test_SingleNodeBackupText(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -549,14 +583,17 @@ func Test_SingleNodeSingleCommandTrigger(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -595,14 +632,17 @@ func Test_SingleNodeLoadText(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -637,14 +677,17 @@ func Test_SingleNodeLoadTextNoStatements(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -663,14 +706,17 @@ func Test_SingleNodeLoadTextEmpty(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -686,14 +732,17 @@ func Test_SingleNodeLoadTextChinook(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -749,14 +798,17 @@ func Test_SingleNodeLoadBinary(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -835,13 +887,17 @@ func Test_SingleNodeRecoverNoChange(t *testing.T) {
+ 	s, ln := mustNewStore(true)
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+-	if err := s.Open(); err != nil {
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -878,10 +934,10 @@ func Test_SingleNodeRecoverNoChange(t *testing.T) {
+ 	peersPath := filepath.Join(s.Path(), "/raft/peers.json")
+ 	peersInfo := filepath.Join(s.Path(), "/raft/peers.info")
+ 	mustWriteFile(peersPath, peers)
+-	if err := s.Open(); err != nil {
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 	queryTest()
+@@ -903,13 +959,17 @@ func Test_SingleNodeRecoverNetworkChange(t *testing.T) {
+ 	s0, ln0 := mustNewStore(true)
+ 	defer os.RemoveAll(s0.Path())
+ 	defer ln0.Close()
+-	if err := s0.Open(); err != nil {
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s0.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s0.Bootstrap(NewServer(s0.ID(), s0.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s0.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -956,11 +1016,11 @@ func Test_SingleNodeRecoverNetworkChange(t *testing.T) {
+ 	peersPath := filepath.Join(sR.Path(), "/raft/peers.json")
+ 	peersInfo := filepath.Join(sR.Path(), "/raft/peers.info")
+ 	mustWriteFile(peersPath, peers)
+-	if err := sR.Open(); err != nil {
++	if err := sR.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 
+-	if _, err := sR.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := sR.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader on recovered node: %s", err)
+ 	}
+ 
+@@ -983,15 +1043,19 @@ func Test_SingleNodeRecoverNetworkChangeSnapshot(t *testing.T) {
+ 	s0, ln0 := mustNewStore(true)
+ 	defer os.RemoveAll(s0.Path())
+ 	defer ln0.Close()
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	s0.SnapshotThreshold = 4
+ 	s0.SnapshotInterval = 100 * time.Millisecond
+-	if err := s0.Open(); err != nil {
++	if err := s0.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	if err := s0.Bootstrap(NewServer(s0.ID(), s0.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s0.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -1058,11 +1122,12 @@ func Test_SingleNodeRecoverNetworkChangeSnapshot(t *testing.T) {
+ 	peersPath := filepath.Join(sR.Path(), "/raft/peers.json")
+ 	peersInfo := filepath.Join(sR.Path(), "/raft/peers.info")
+ 	mustWriteFile(peersPath, peers)
+-	if err := sR.Open(); err != nil {
++
++	if err := sR.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 
+-	if _, err := sR.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := sR.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader on recovered node: %s", err)
+ 	}
+ 	queryTest(sR, 10)
+@@ -1082,7 +1147,11 @@ func Test_SingleNodeSelfJoinFail(t *testing.T) {
+ 	s0, ln0 := mustNewStore(true)
+ 	defer os.RemoveAll(s0.Path())
+ 	defer ln0.Close()
+-	if err := s0.Open(); err != nil {
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s0.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s0.Close(true)
+@@ -1090,7 +1159,7 @@ func Test_SingleNodeSelfJoinFail(t *testing.T) {
+ 	if err := s0.Bootstrap(NewServer(s0.ID(), s0.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s0.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -1108,21 +1177,25 @@ func Test_MultiNodeJoinRemove(t *testing.T) {
+ 	s0, ln0 := mustNewStore(true)
+ 	defer os.RemoveAll(s0.Path())
+ 	defer ln0.Close()
+-	if err := s0.Open(); err != nil {
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s0.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s0.Close(true)
+ 	if err := s0.Bootstrap(NewServer(s0.ID(), s0.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s0.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+ 	s1, ln1 := mustNewStore(true)
+ 	defer os.RemoveAll(s1.Path())
+ 	defer ln1.Close()
+-	if err := s1.Open(); err != nil {
++	if err := s1.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s1.Close(true)
+@@ -1139,7 +1212,7 @@ func Test_MultiNodeJoinRemove(t *testing.T) {
+ 		t.Fatalf("failed to join to node at %s: %s", s0.Addr(), err.Error())
+ 	}
+ 
+-	got, err := s1.WaitForLeader(10 * time.Second)
++	got, err := s1.WaitForLeader(ctx, 10*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("failed to get leader address on follower: %s", err.Error())
+ 	}
+@@ -1155,7 +1228,7 @@ func Test_MultiNodeJoinRemove(t *testing.T) {
+ 		t.Fatalf("wrong leader ID returned, got: %s, exp %s", got, exp)
+ 	}
+ 
+-	nodes, err := s0.Nodes()
++	nodes, err := s0.Nodes(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get nodes: %s", err.Error())
+ 	}
+@@ -1172,7 +1245,7 @@ func Test_MultiNodeJoinRemove(t *testing.T) {
+ 		t.Fatalf("failed to remove %s from cluster: %s", s1.ID(), err.Error())
+ 	}
+ 
+-	nodes, err = s0.Nodes()
++	nodes, err = s0.Nodes(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get nodes post remove: %s", err.Error())
+ 	}
+@@ -1188,7 +1261,11 @@ func Test_MultiNodeStoreNotifyBootstrap(t *testing.T) {
+ 	s0, ln0 := mustNewStore(true)
+ 	defer os.RemoveAll(s0.Path())
+ 	defer ln0.Close()
+-	if err := s0.Open(); err != nil {
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s0.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s0.Close(true)
+@@ -1196,7 +1273,7 @@ func Test_MultiNodeStoreNotifyBootstrap(t *testing.T) {
+ 	s1, ln1 := mustNewStore(true)
+ 	defer os.RemoveAll(s1.Path())
+ 	defer ln1.Close()
+-	if err := s1.Open(); err != nil {
++	if err := s1.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s1.Close(true)
+@@ -1204,7 +1281,7 @@ func Test_MultiNodeStoreNotifyBootstrap(t *testing.T) {
+ 	s2, ln2 := mustNewStore(true)
+ 	defer os.RemoveAll(s2.Path())
+ 	defer ln2.Close()
+-	if err := s2.Open(); err != nil {
++	if err := s2.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s2.Close(true)
+@@ -1224,33 +1301,33 @@ func Test_MultiNodeStoreNotifyBootstrap(t *testing.T) {
+ 	}
+ 
+ 	// Check that the cluster bootstrapped properly.
+-	leader0, err := s0.WaitForLeader(10 * time.Second)
++	leader0, err := s0.WaitForLeader(ctx, 10*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("failed to get leader: %s", err.Error())
+ 	}
+-	nodes, err := s0.Nodes()
++	nodes, err := s0.Nodes(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get nodes: %s", err.Error())
+ 	}
+ 	if len(nodes) != 3 {
+ 		t.Fatalf("size of bootstrapped cluster is not correct")
+ 	}
+-	leader1, err := s1.WaitForLeader(10 * time.Second)
++	leader1, err := s1.WaitForLeader(ctx, 10*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("failed to get leader: %s", err.Error())
+ 	}
+-	nodes, err = s1.Nodes()
++	nodes, err = s1.Nodes(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get nodes: %s", err.Error())
+ 	}
+ 	if len(nodes) != 3 {
+ 		t.Fatalf("size of bootstrapped cluster is not correct")
+ 	}
+-	leader2, err := s2.WaitForLeader(10 * time.Second)
++	leader2, err := s2.WaitForLeader(ctx, 10*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("failed to get leader: %s", err.Error())
+ 	}
+-	nodes, err = s2.Nodes()
++	nodes, err = s2.Nodes(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get nodes: %s", err.Error())
+ 	}
+@@ -1274,21 +1351,25 @@ func Test_MultiNodeJoinNonVoterRemove(t *testing.T) {
+ 	s0, ln0 := mustNewStore(true)
+ 	defer os.RemoveAll(s0.Path())
+ 	defer ln0.Close()
+-	if err := s0.Open(); err != nil {
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s0.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s0.Close(true)
+ 	if err := s0.Bootstrap(NewServer(s0.ID(), s0.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s0.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+ 	s1, ln1 := mustNewStore(true)
+ 	defer os.RemoveAll(s1.Path())
+ 	defer ln1.Close()
+-	if err := s1.Open(); err != nil {
++	if err := s1.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s1.Close(true)
+@@ -1302,7 +1383,7 @@ func Test_MultiNodeJoinNonVoterRemove(t *testing.T) {
+ 		t.Fatalf("failed to join to node at %s: %s", s0.Addr(), err.Error())
+ 	}
+ 
+-	if _, err := s1.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s1.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -1322,7 +1403,7 @@ func Test_MultiNodeJoinNonVoterRemove(t *testing.T) {
+ 		t.Fatalf("wrong leader ID returned, got: %s, exp %s", got, exp)
+ 	}
+ 
+-	nodes, err := s0.Nodes()
++	nodes, err := s0.Nodes(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get nodes: %s", err.Error())
+ 	}
+@@ -1339,7 +1420,7 @@ func Test_MultiNodeJoinNonVoterRemove(t *testing.T) {
+ 		t.Fatalf("failed to remove %s from cluster: %s", s1.ID(), err.Error())
+ 	}
+ 
+-	nodes, err = s0.Nodes()
++	nodes, err = s0.Nodes(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get nodes post remove: %s", err.Error())
+ 	}
+@@ -1355,21 +1436,25 @@ func Test_MultiNodeExecuteQuery(t *testing.T) {
+ 	s0, ln0 := mustNewStore(true)
+ 	defer os.RemoveAll(s0.Path())
+ 	defer ln0.Close()
+-	if err := s0.Open(); err != nil {
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s0.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s0.Close(true)
+ 	if err := s0.Bootstrap(NewServer(s0.ID(), s0.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s0.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+ 	s1, ln1 := mustNewStore(true)
+ 	defer os.RemoveAll(s1.Path())
+ 	defer ln1.Close()
+-	if err := s1.Open(); err != nil {
++	if err := s1.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open node for multi-node test: %s", err.Error())
+ 	}
+ 	defer s1.Close(true)
+@@ -1377,7 +1462,7 @@ func Test_MultiNodeExecuteQuery(t *testing.T) {
+ 	s2, ln2 := mustNewStore(true)
+ 	defer os.RemoveAll(s2.Path())
+ 	defer ln2.Close()
+-	if err := s2.Open(); err != nil {
++	if err := s2.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open node for multi-node test: %s", err.Error())
+ 	}
+ 	defer s2.Close(true)
+@@ -1400,7 +1485,7 @@ func Test_MultiNodeExecuteQuery(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("failed to execute on single node: %s", err.Error())
+ 	}
+-	s0FsmIdx, err := s0.WaitForAppliedFSM(5 * time.Second)
++	s0FsmIdx, err := s0.WaitForAppliedFSM(ctx, 5*time.Second)
+ 	if err != nil {
+ 		t.Fatalf("failed to wait for fsmIndex: %s", err.Error())
+ 	}
+@@ -1420,7 +1505,7 @@ func Test_MultiNodeExecuteQuery(t *testing.T) {
+ 
+ 	// Wait until the log entries have been applied to the voting follower,
+ 	// and then query.
+-	if _, err := s1.WaitForFSMIndex(s0FsmIdx, 5*time.Second); err != nil {
++	if _, err := s1.WaitForFSMIndex(ctx, s0FsmIdx, 5*time.Second); err != nil {
+ 		t.Fatalf("error waiting for follower to apply index: %s:", err.Error())
+ 	}
+ 
+@@ -1448,7 +1533,7 @@ func Test_MultiNodeExecuteQuery(t *testing.T) {
+ 
+ 	// Wait until the 3 log entries have been applied to the non-voting follower,
+ 	// and then query.
+-	if err := s2.WaitForAppliedIndex(3, 5*time.Second); err != nil {
++	if err := s2.WaitForAppliedIndex(ctx, 3, 5*time.Second); err != nil {
+ 		t.Fatalf("error waiting for follower to apply index: %s:", err.Error())
+ 	}
+ 
+@@ -1479,21 +1564,25 @@ func Test_MultiNodeExecuteQueryFreshness(t *testing.T) {
+ 	s0, ln0 := mustNewStore(true)
+ 	defer os.RemoveAll(s0.Path())
+ 	defer ln0.Close()
+-	if err := s0.Open(); err != nil {
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s0.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s0.Close(true)
+ 	if err := s0.Bootstrap(NewServer(s0.ID(), s0.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s0.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+ 	s1, ln1 := mustNewStore(true)
+ 	defer os.RemoveAll(s1.Path())
+ 	defer ln1.Close()
+-	if err := s1.Open(); err != nil {
++	if err := s1.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open node for multi-node test: %s", err.Error())
+ 	}
+ 	defer s1.Close(true)
+@@ -1527,7 +1616,7 @@ func Test_MultiNodeExecuteQueryFreshness(t *testing.T) {
+ 
+ 	// Wait until the 3 log entries have been applied to the follower,
+ 	// and then query.
+-	if err := s1.WaitForAppliedIndex(3, 5*time.Second); err != nil {
++	if err := s1.WaitForAppliedIndex(ctx, 3, 5*time.Second); err != nil {
+ 		t.Fatalf("error waiting for follower to apply index: %s:", err.Error())
+ 	}
+ 
+@@ -1611,17 +1700,21 @@ func Test_StoreLogTruncationMultinode(t *testing.T) {
+ 	s0, ln0 := mustNewStore(true)
+ 	defer os.RemoveAll(s0.Path())
+ 	defer ln0.Close()
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	s0.SnapshotThreshold = 4
+ 	s0.SnapshotInterval = 100 * time.Millisecond
+ 
+-	if err := s0.Open(); err != nil {
++	if err := s0.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s0.Close(true)
+ 	if err := s0.Bootstrap(NewServer(s0.ID(), s0.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s0.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s0.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -1660,7 +1753,7 @@ func Test_StoreLogTruncationMultinode(t *testing.T) {
+ 	// involve getting a snapshot and truncated log.
+ 	s1, ln1 := mustNewStore(true)
+ 	defer ln1.Close()
+-	if err := s1.Open(); err != nil {
++	if err := s1.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s1.Close(true)
+@@ -1669,12 +1762,12 @@ func Test_StoreLogTruncationMultinode(t *testing.T) {
+ 	if err := s0.Join(s1.ID(), s1.Addr(), true); err != nil {
+ 		t.Fatalf("failed to join to node at %s: %s", s0.Addr(), err.Error())
+ 	}
+-	if _, err := s1.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s1.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 	// Wait until the log entries have been applied to the follower,
+ 	// and then query.
+-	if err := s1.WaitForAppliedIndex(8, 5*time.Second); err != nil {
++	if err := s1.WaitForAppliedIndex(ctx, 8, 5*time.Second); err != nil {
+ 		t.Fatalf("error waiting for follower to apply index: %s:", err.Error())
+ 	}
+ 	qr := queryRequestFromString("SELECT count(*) FROM foo", false, true)
+@@ -1696,14 +1789,17 @@ func Test_SingleNodeSnapshotOnDisk(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -1764,14 +1860,17 @@ func Test_SingleNodeSnapshotInMem(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -1849,14 +1948,17 @@ func Test_SingleNodeRestoreNoncompressed(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -1887,14 +1989,18 @@ func Test_SingleNodeNoop(t *testing.T) {
+ 	s, ln := mustNewStore(true)
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+-	if err := s.Open(); err != nil {
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -1911,14 +2017,17 @@ func Test_IsLeader(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+@@ -1932,14 +2041,17 @@ func Test_State(t *testing.T) {
+ 	defer os.RemoveAll(s.Path())
+ 	defer ln.Close()
+ 
+-	if err := s.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	if err := s.Open(ctx); err != nil {
+ 		t.Fatalf("failed to open single-node store: %s", err.Error())
+ 	}
+ 	defer s.Close(true)
+ 	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+ 		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+ 	}
+-	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
++	if _, err := s.WaitForLeader(ctx, 10*time.Second); err != nil {
+ 		t.Fatalf("Error waiting for leader: %s", err)
+ 	}
+ 
+diff --git a/system_test/cluster_test.go b/system_test/cluster_test.go
+index 221840f..6d593e8 100644
+--- a/system_test/cluster_test.go
++++ b/system_test/cluster_test.go
+@@ -1,6 +1,7 @@
+ package system
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"net"
+ 	"sync"
+@@ -13,7 +14,10 @@ import (
+ 
+ // Test_JoinLeaderNode tests a join operation between a leader and a new node.
+ func Test_JoinLeaderNode(t *testing.T) {
+-	leader := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	leader := mustNewLeaderNode(ctx)
+ 	defer leader.Deprovision()
+ 
+ 	node := mustNewNode(false)
+@@ -21,7 +25,7 @@ func Test_JoinLeaderNode(t *testing.T) {
+ 	if err := node.Join(leader); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node.WaitForLeader()
++	_, err := node.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -29,7 +33,10 @@ func Test_JoinLeaderNode(t *testing.T) {
+ 
+ // Test_MultiNodeCluster tests formation of a 3-node cluster, and its operation.
+ func Test_MultiNodeCluster(t *testing.T) {
+-	node1 := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node1 := mustNewLeaderNode(ctx)
+ 	defer node1.Deprovision()
+ 
+ 	node2 := mustNewNode(false)
+@@ -37,20 +44,20 @@ func Test_MultiNodeCluster(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node2.WaitForLeader()
++	_, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c := Cluster{node1, node2}
+-	leader, err := c.Leader()
++	leader, err := c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+ 
+ 	// Get a follower and confirm redirects work properly.
+-	followers, err := c.Followers()
++	followers, err := c.Followers(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get followers: %s", err.Error())
+ 	}
+@@ -63,14 +70,14 @@ func Test_MultiNodeCluster(t *testing.T) {
+ 	if err := node3.Join(leader); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node3.WaitForLeader()
++	_, err = node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c = Cluster{node1, node2, node3}
+-	leader, err = c.Leader()
++	leader, err = c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -117,7 +124,7 @@ func Test_MultiNodeCluster(t *testing.T) {
+ 	// Kill the leader and wait for the new leader.
+ 	leader.Deprovision()
+ 	c.RemoveNode(leader)
+-	leader, err = c.WaitForNewLeader(leader)
++	leader, err = c.WaitForNewLeader(ctx, leader)
+ 	if err != nil {
+ 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
+ 	}
+@@ -165,6 +172,9 @@ func Test_MultiNodeCluster(t *testing.T) {
+ // Test_MultiNodeClusterBootstrap tests formation of a 3-node cluster via bootstraping,
+ // and its operation.
+ func Test_MultiNodeClusterBootstrap(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	node1 := mustNewNode(false)
+ 	node1.Store.BootstrapExpect = 3
+ 	defer node1.Deprovision()
+@@ -214,13 +224,13 @@ func Test_MultiNodeClusterBootstrap(t *testing.T) {
+ 	wg.Wait()
+ 
+ 	// Wait for leader election
+-	_, err := node1.WaitForLeader()
++	_, err := node1.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for a leader: %s", err.Error())
+ 	}
+ 
+ 	c := Cluster{node1, node2, node3}
+-	leader, err := c.Leader()
++	leader, err := c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -267,7 +277,7 @@ func Test_MultiNodeClusterBootstrap(t *testing.T) {
+ 	// Kill the leader and wait for the new leader.
+ 	leader.Deprovision()
+ 	c.RemoveNode(leader)
+-	leader, err = c.WaitForNewLeader(leader)
++	leader, err = c.WaitForNewLeader(ctx, leader)
+ 	if err != nil {
+ 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
+ 	}
+@@ -315,6 +325,9 @@ func Test_MultiNodeClusterBootstrap(t *testing.T) {
+ // Test_MultiNodeClusterBootstrapLaterJoin tests formation of a 3-node cluster and
+ // then checking a 4th node can join later with the bootstap parameters.
+ func Test_MultiNodeClusterBootstrapLaterJoin(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	node1 := mustNewNode(false)
+ 	node1.Store.BootstrapExpect = 3
+ 	defer node1.Deprovision()
+@@ -367,15 +380,15 @@ func Test_MultiNodeClusterBootstrapLaterJoin(t *testing.T) {
+ 	wg.Wait()
+ 
+ 	// Check leaders
+-	node1Leader, err := node1.WaitForLeader()
++	node1Leader, err := node1.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for a leader: %s", err.Error())
+ 	}
+-	node2Leader, err := node2.WaitForLeader()
++	node2Leader, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for a leader: %s", err.Error())
+ 	}
+-	node3Leader, err := node3.WaitForLeader()
++	node3Leader, err := node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for a leader: %s", err.Error())
+ 	}
+@@ -401,7 +414,7 @@ func Test_MultiNodeClusterBootstrapLaterJoin(t *testing.T) {
+ 	if err := node4Bs.Boot(node4.ID, node4.RaftAddr, done, 10*time.Second); err != nil {
+ 		t.Fatalf("node 4 failed to boot")
+ 	}
+-	node4Leader, err := node4.WaitForLeader()
++	node4Leader, err := node4.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for a leader: %s", err.Error())
+ 	}
+@@ -413,6 +426,9 @@ func Test_MultiNodeClusterBootstrapLaterJoin(t *testing.T) {
+ // Test_MultiNodeClusterBootstrapLaterJoinHTTPS tests formation of a 3-node cluster which
+ // uses HTTP and TLS,then checking a 4th node can join later with the bootstap parameters.
+ func Test_MultiNodeClusterBootstrapLaterJoinHTTPS(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	node1 := mustNewNodeEncrypted(false, true, true)
+ 	node1.Store.BootstrapExpect = 3
+ 	defer node1.Deprovision()
+@@ -465,15 +481,15 @@ func Test_MultiNodeClusterBootstrapLaterJoinHTTPS(t *testing.T) {
+ 	wg.Wait()
+ 
+ 	// Check leaders
+-	node1Leader, err := node1.WaitForLeader()
++	node1Leader, err := node1.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for a leader: %s", err.Error())
+ 	}
+-	node2Leader, err := node2.WaitForLeader()
++	node2Leader, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for a leader: %s", err.Error())
+ 	}
+-	node3Leader, err := node3.WaitForLeader()
++	node3Leader, err := node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for a leader: %s", err.Error())
+ 	}
+@@ -499,7 +515,7 @@ func Test_MultiNodeClusterBootstrapLaterJoinHTTPS(t *testing.T) {
+ 	if err := node4Bs.Boot(node4.ID, node4.RaftAddr, done, 10*time.Second); err != nil {
+ 		t.Fatalf("node 4 failed to boot")
+ 	}
+-	node4Leader, err := node4.WaitForLeader()
++	node4Leader, err := node4.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for a leader: %s", err.Error())
+ 	}
+@@ -510,6 +526,9 @@ func Test_MultiNodeClusterBootstrapLaterJoinHTTPS(t *testing.T) {
+ 
+ // Test_MultiNodeClusterRaftAdv tests 3-node cluster with advertised Raft addresses usage.
+ func Test_MultiNodeClusterRaftAdv(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	ln1 := mustTCPListener("0.0.0.0:0")
+ 	defer ln1.Close()
+ 	ln2 := mustTCPListener("0.0.0.0:0")
+@@ -549,7 +568,7 @@ func Test_MultiNodeClusterRaftAdv(t *testing.T) {
+ 	// Start two nodes, and ensure a cluster can be formed.
+ 	node1 := mustNodeEncrypted(mustTempDir(), true, false, mux1, "1")
+ 	defer node1.Deprovision()
+-	leader, err := node1.WaitForLeader()
++	leader, err := node1.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader on node1: %s", err.Error())
+ 	}
+@@ -562,7 +581,7 @@ func Test_MultiNodeClusterRaftAdv(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node2 failed to join leader: %s", err.Error())
+ 	}
+-	leader, err = node2.WaitForLeader()
++	leader, err = node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader on node2: %s", err.Error())
+ 	}
+@@ -573,7 +592,10 @@ func Test_MultiNodeClusterRaftAdv(t *testing.T) {
+ 
+ // Test_MultiNodeClusterNodes checks nodes/ endpoint under various situations.
+ func Test_MultiNodeClusterNodes(t *testing.T) {
+-	node1 := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node1 := mustNewLeaderNode(ctx)
+ 	defer node1.Deprovision()
+ 
+ 	node2 := mustNewNode(false)
+@@ -581,14 +603,14 @@ func Test_MultiNodeClusterNodes(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node2.WaitForLeader()
++	_, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c := Cluster{node1, node2}
+-	leader, err := c.Leader()
++	leader, err := c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -598,14 +620,14 @@ func Test_MultiNodeClusterNodes(t *testing.T) {
+ 	if err := node3.Join(leader); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node3.WaitForLeader()
++	_, err = node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c = Cluster{node1, node2, node3}
+-	leader, err = c.Leader()
++	leader, err = c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -637,7 +659,7 @@ func Test_MultiNodeClusterNodes(t *testing.T) {
+ 	}
+ 
+ 	// Get a follower and confirm nodes/ looks good.
+-	followers, err := c.Followers()
++	followers, err := c.Followers(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get followers: %s", err.Error())
+ 	}
+@@ -662,7 +684,10 @@ func Test_MultiNodeClusterNodes(t *testing.T) {
+ 
+ // Test_MultiNodeClusterNodesNonVoter checks nodes/ endpoint with a non-voting node.
+ func Test_MultiNodeClusterNodesNonVoter(t *testing.T) {
+-	node1 := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node1 := mustNewLeaderNode(ctx)
+ 	defer node1.Deprovision()
+ 
+ 	node2 := mustNewNode(false)
+@@ -670,14 +695,14 @@ func Test_MultiNodeClusterNodesNonVoter(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node2.WaitForLeader()
++	_, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c := Cluster{node1, node2}
+-	leader, err := c.Leader()
++	leader, err := c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -687,14 +712,14 @@ func Test_MultiNodeClusterNodesNonVoter(t *testing.T) {
+ 	if err := node3.JoinAsNonVoter(leader); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node3.WaitForLeader()
++	_, err = node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c = Cluster{node1, node2, node3}
+-	_, err = c.Leader()
++	_, err = c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -720,9 +745,12 @@ func Test_MultiNodeClusterNodesNonVoter(t *testing.T) {
+ // Test_MultiNodeClusterNodeEncrypted tests formation of a 3-node cluster, and its operation.
+ // This test enables inter-node encryption, but keeps the unencrypted HTTP API.
+ func Test_MultiNodeClusterNodeEncrypted(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	node1 := mustNewNodeEncrypted(true, false, true)
+ 	defer node1.Deprovision()
+-	if _, err := node1.WaitForLeader(); err != nil {
++	if _, err := node1.WaitForLeader(ctx); err != nil {
+ 		t.Fatalf("node never became leader")
+ 	}
+ 
+@@ -731,20 +759,20 @@ func Test_MultiNodeClusterNodeEncrypted(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node2.WaitForLeader()
++	_, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c := Cluster{node1, node2}
+-	leader, err := c.Leader()
++	leader, err := c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+ 
+ 	// Check the followers
+-	followers, err := c.Followers()
++	followers, err := c.Followers(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get followers: %s", err.Error())
+ 	}
+@@ -757,20 +785,20 @@ func Test_MultiNodeClusterNodeEncrypted(t *testing.T) {
+ 	if err := node3.Join(leader); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node3.WaitForLeader()
++	_, err = node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c = Cluster{node1, node2, node3}
+-	leader, err = c.Leader()
++	leader, err = c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+ 
+ 	// Check the followers
+-	followers, err = c.Followers()
++	followers, err = c.Followers(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get followers: %s", err.Error())
+ 	}
+@@ -820,7 +848,7 @@ func Test_MultiNodeClusterNodeEncrypted(t *testing.T) {
+ 	// Kill the leader and wait for the new leader.
+ 	leader.Deprovision()
+ 	c.RemoveNode(leader)
+-	leader, err = c.WaitForNewLeader(leader)
++	leader, err = c.WaitForNewLeader(ctx, leader)
+ 	if err != nil {
+ 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
+ 	}
+@@ -867,7 +895,10 @@ func Test_MultiNodeClusterNodeEncrypted(t *testing.T) {
+ 
+ // Test_MultiNodeClusterSnapshot tests formation of a 3-node cluster, which involves sharing snapshots.
+ func Test_MultiNodeClusterSnapshot(t *testing.T) {
+-	node1 := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node1 := mustNewLeaderNode(ctx)
+ 	defer node1.Deprovision()
+ 
+ 	if _, err := node1.Execute(`CREATE TABLE foo (id integer not null primary key, name text)`); err != nil {
+@@ -888,7 +919,7 @@ func Test_MultiNodeClusterSnapshot(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node2.WaitForLeader()
++	_, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -898,7 +929,7 @@ func Test_MultiNodeClusterSnapshot(t *testing.T) {
+ 	if err := node3.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node3.WaitForLeader()
++	_, err = node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -907,7 +938,7 @@ func Test_MultiNodeClusterSnapshot(t *testing.T) {
+ 	c := Cluster{node1, node2, node3}
+ 
+ 	// Wait for followers to pick up state.
+-	followers, err := c.Followers()
++	followers, err := c.Followers(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to determine followers: %s", err.Error())
+ 	}
+@@ -940,7 +971,7 @@ func Test_MultiNodeClusterSnapshot(t *testing.T) {
+ 	node1.Deprovision()
+ 	c.RemoveNode(node1)
+ 	var leader *Node
+-	leader, err = c.WaitForNewLeader(node1)
++	leader, err = c.WaitForNewLeader(ctx, node1)
+ 	if err != nil {
+ 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
+ 	}
+@@ -971,7 +1002,10 @@ func Test_MultiNodeClusterSnapshot(t *testing.T) {
+ // Test_MultiNodeClusterWithNonVoter tests formation of a 4-node cluster, one of which is
+ // a non-voter
+ func Test_MultiNodeClusterWithNonVoter(t *testing.T) {
+-	node1 := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node1 := mustNewLeaderNode(ctx)
+ 	defer node1.Deprovision()
+ 
+ 	node2 := mustNewNode(false)
+@@ -979,14 +1013,14 @@ func Test_MultiNodeClusterWithNonVoter(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node2.WaitForLeader()
++	_, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c := Cluster{node1, node2}
+-	leader, err := c.Leader()
++	leader, err := c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -996,14 +1030,14 @@ func Test_MultiNodeClusterWithNonVoter(t *testing.T) {
+ 	if err := node3.Join(leader); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node3.WaitForLeader()
++	_, err = node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c = Cluster{node1, node2, node3}
+-	leader, err = c.Leader()
++	leader, err = c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -1013,7 +1047,7 @@ func Test_MultiNodeClusterWithNonVoter(t *testing.T) {
+ 	if err := nonVoter.JoinAsNonVoter(leader); err != nil {
+ 		t.Fatalf("non-voting node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = nonVoter.WaitForLeader()
++	_, err = nonVoter.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -1061,7 +1095,7 @@ func Test_MultiNodeClusterWithNonVoter(t *testing.T) {
+ 	// Kill the leader and wait for the new leader.
+ 	leader.Deprovision()
+ 	c.RemoveNode(leader)
+-	leader, err = c.WaitForNewLeader(leader)
++	leader, err = c.WaitForNewLeader(ctx, leader)
+ 	if err != nil {
+ 		t.Fatalf("failed to find new cluster leader after killing leader: %s", err.Error())
+ 	}
+@@ -1109,7 +1143,10 @@ func Test_MultiNodeClusterWithNonVoter(t *testing.T) {
+ // Test_MultiNodeClusterRecoverSingle tests recovery of a single node from a 3-node cluster,
+ // which no longer has quorum.
+ func Test_MultiNodeClusterRecoverSingle(t *testing.T) {
+-	node1 := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node1 := mustNewLeaderNode(ctx)
+ 	defer node1.Deprovision()
+ 
+ 	if _, err := node1.Execute(`CREATE TABLE foo (id integer not null primary key, name text)`); err != nil {
+@@ -1128,7 +1165,7 @@ func Test_MultiNodeClusterRecoverSingle(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node2.WaitForLeader()
++	_, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -1138,7 +1175,7 @@ func Test_MultiNodeClusterRecoverSingle(t *testing.T) {
+ 	if err := node3.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node3.WaitForLeader()
++	_, err = node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -1159,7 +1196,7 @@ func Test_MultiNodeClusterRecoverSingle(t *testing.T) {
+ 	// changing, but it generally proves it doesn't come up.
+ 	mux0, ln0 := mustNewOpenMux("127.0.0.1:10000")
+ 	failedSingle := mustNodeEncrypted(node1.Dir, true, false, mux0, node1.Store.ID())
+-	_, err = failedSingle.WaitForLeader()
++	_, err = failedSingle.WaitForLeader(ctx)
+ 	if err == nil {
+ 		t.Fatalf("no error waiting for leader")
+ 	}
+@@ -1172,7 +1209,7 @@ func Test_MultiNodeClusterRecoverSingle(t *testing.T) {
+ 	mustWriteFile(node1.PeersPath, peers)
+ 
+ 	okSingle := mustNodeEncrypted(node1.Dir, true, false, mux1, node1.Store.ID())
+-	_, err = okSingle.WaitForLeader()
++	_, err = okSingle.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -1186,11 +1223,14 @@ func Test_MultiNodeClusterRecoverSingle(t *testing.T) {
+ // Test_MultiNodeClusterRecoverFull tests recovery of a full 3-node cluster,
+ // each node coming up with a different Raft address.
+ func Test_MultiNodeClusterRecoverFull(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	var err error
+ 
+ 	mux1, ln1 := mustNewOpenMux("127.0.0.1:10001")
+ 	node1 := mustNodeEncrypted(mustTempDir(), true, false, mux1, "1")
+-	_, err = node1.WaitForLeader()
++	_, err = node1.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -1200,7 +1240,7 @@ func Test_MultiNodeClusterRecoverFull(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node2.WaitForLeader()
++	_, err = node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -1210,7 +1250,7 @@ func Test_MultiNodeClusterRecoverFull(t *testing.T) {
+ 	if err := node3.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node3.WaitForLeader()
++	_, err = node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+@@ -1264,7 +1304,7 @@ func Test_MultiNodeClusterRecoverFull(t *testing.T) {
+ 	defer node6.Deprovision()
+ 	defer ln6.Close()
+ 
+-	_, err = node6.WaitForLeader()
++	_, err = node6.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader on recovered cluster: %s", err.Error())
+ 	}
+diff --git a/system_test/helpers.go b/system_test/helpers.go
+index 8b6bd99..4af2631 100644
+--- a/system_test/helpers.go
++++ b/system_test/helpers.go
+@@ -2,6 +2,7 @@ package system
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"crypto/tls"
+ 	"crypto/x509"
+ 	"encoding/json"
+@@ -22,6 +23,7 @@ import (
+ 	"github.com/rqlite/rqlite/store"
+ 	"github.com/rqlite/rqlite/tcp"
+ 	rX509 "github.com/rqlite/rqlite/testdata/x509"
++	"go.opentelemetry.io/otel"
+ )
+ 
+ const (
+@@ -70,8 +72,13 @@ func (n *Node) Deprovision() {
+ }
+ 
+ // WaitForLeader blocks for up to 10 seconds until the node detects a leader.
+-func (n *Node) WaitForLeader() (string, error) {
+-	return n.Store.WaitForLeader(10 * time.Second)
++func (n *Node) WaitForLeader(ctx context.Context) (string, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-system_test")
++	ctx, span := tr.Start(ctx, "WaitForLeader")
++	defer span.End()
++
++	return n.Store.WaitForLeader(ctx, 10*time.Second)
+ }
+ 
+ // Execute executes a single statement against the node.
+@@ -389,8 +396,13 @@ func PostExecuteStmtMulti(apiAddr string, stmts []string) (string, error) {
+ type Cluster []*Node
+ 
+ // Leader returns the leader node of a cluster.
+-func (c Cluster) Leader() (*Node, error) {
+-	l, err := c[0].WaitForLeader()
++func (c Cluster) Leader(ctx context.Context) (*Node, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-system_test")
++	ctx, span := tr.Start(ctx, "Leader")
++	defer span.End()
++
++	l, err := c[0].WaitForLeader(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -398,7 +410,12 @@ func (c Cluster) Leader() (*Node, error) {
+ }
+ 
+ // WaitForNewLeader waits for the leader to change from the node passed in.
+-func (c Cluster) WaitForNewLeader(old *Node) (*Node, error) {
++func (c Cluster) WaitForNewLeader(ctx context.Context, old *Node) (*Node, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-system_test")
++	ctx, span := tr.Start(ctx, "WaitForNewLeader")
++	defer span.End()
++
+ 	timer := time.NewTimer(30 * time.Second)
+ 	defer timer.Stop()
+ 	ticker := time.NewTicker(100 * time.Millisecond)
+@@ -409,7 +426,7 @@ func (c Cluster) WaitForNewLeader(old *Node) (*Node, error) {
+ 		case <-timer.C:
+ 			return nil, fmt.Errorf("timed out waiting for new leader")
+ 		case <-ticker.C:
+-			l, err := c.Leader()
++			l, err := c.Leader(ctx)
+ 			if err != nil {
+ 				continue
+ 			}
+@@ -421,8 +438,13 @@ func (c Cluster) WaitForNewLeader(old *Node) (*Node, error) {
+ }
+ 
+ // Followers returns the slice of nodes in the cluster that are followers.
+-func (c Cluster) Followers() ([]*Node, error) {
+-	n, err := c[0].WaitForLeader()
++func (c Cluster) Followers(ctx context.Context) ([]*Node, error) {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-system_test")
++	ctx, span := tr.Start(ctx, "Followers")
++	defer span.End()
++
++	n, err := c[0].WaitForLeader(ctx)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -569,7 +591,9 @@ func mustNodeEncryptedOnDisk(dir string, enableSingle, httpEncrypt bool, mux *tc
+ 	node.Store.SnapshotThreshold = 100
+ 	node.Store.SnapshotInterval = SnapshotInterval
+ 
+-	if err := node.Store.Open(); err != nil {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	if err := node.Store.Open(ctx); err != nil {
+ 		node.Deprovision()
+ 		panic(fmt.Sprintf("failed to open store: %s", err.Error()))
+ 	}
+@@ -610,9 +634,14 @@ func mustNodeEncryptedOnDisk(dir string, enableSingle, httpEncrypt bool, mux *tc
+ 	return node
+ }
+ 
+-func mustNewLeaderNode() *Node {
++func mustNewLeaderNode(ctx context.Context) *Node {
++	// Use the global TracerProvider.
++	tr := otel.Tracer("rqlite-system_test")
++	ctx, span := tr.Start(ctx, "mustNewLeaderNode")
++	defer span.End()
++
+ 	node := mustNewNode(true)
+-	if _, err := node.WaitForLeader(); err != nil {
++	if _, err := node.WaitForLeader(ctx); err != nil {
+ 		node.Deprovision()
+ 		panic("node never became leader")
+ 	}
+diff --git a/system_test/request_forwarding_test.go b/system_test/request_forwarding_test.go
+index 3365c4c..6ae82a6 100644
+--- a/system_test/request_forwarding_test.go
++++ b/system_test/request_forwarding_test.go
+@@ -1,6 +1,7 @@
+ package system
+ 
+ import (
++	"context"
+ 	"testing"
+ 	"time"
+ 
+@@ -14,7 +15,10 @@ const shortWait = 5 * time.Second
+ // Test_StoreClientSideBySide operates on the same store directly, and via
+ // RPC, and ensures results are the same for basically the same operation.
+ func Test_StoreClientSideBySide(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 	leaderAddr, err := node.Store.LeaderAddr()
+ 	if err != nil {
+@@ -102,7 +106,10 @@ func Test_StoreClientSideBySide(t *testing.T) {
+ // Test_MultiNodeCluster tests formation of a 3-node cluster and query
+ // against all nodes to test requests are forwarded to leader transparently.
+ func Test_MultiNodeClusterRequestForwardOK(t *testing.T) {
+-	node1 := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node1 := mustNewLeaderNode(ctx)
+ 	defer node1.Deprovision()
+ 
+ 	node2 := mustNewNode(false)
+@@ -110,14 +117,14 @@ func Test_MultiNodeClusterRequestForwardOK(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node2.WaitForLeader()
++	_, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c := Cluster{node1, node2}
+-	leader, err := c.Leader()
++	leader, err := c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -127,19 +134,19 @@ func Test_MultiNodeClusterRequestForwardOK(t *testing.T) {
+ 	if err := node3.Join(leader); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err = node3.WaitForLeader()
++	_, err = node3.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c = Cluster{node1, node2, node3}
+-	leader, err = c.Leader()
++	leader, err = c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+ 
+-	followers, err := c.Followers()
++	followers, err := c.Followers(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get followers: %s", err.Error())
+ 	}
+@@ -183,7 +190,10 @@ func Test_MultiNodeClusterRequestForwardOK(t *testing.T) {
+ // Test_MultiNodeClusterQueuedRequestForwardOK tests that queued writes are forwarded
+ // correctly.
+ func Test_MultiNodeClusterQueuedRequestForwardOK(t *testing.T) {
+-	node1 := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node1 := mustNewLeaderNode(ctx)
+ 	defer node1.Deprovision()
+ 
+ 	node2 := mustNewNode(false)
+@@ -191,14 +201,14 @@ func Test_MultiNodeClusterQueuedRequestForwardOK(t *testing.T) {
+ 	if err := node2.Join(node1); err != nil {
+ 		t.Fatalf("node failed to join leader: %s", err.Error())
+ 	}
+-	_, err := node2.WaitForLeader()
++	_, err := node2.WaitForLeader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed waiting for leader: %s", err.Error())
+ 	}
+ 
+ 	// Get the new leader, in case it changed.
+ 	c := Cluster{node1, node2}
+-	leader, err := c.Leader()
++	leader, err := c.Leader(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to find cluster leader: %s", err.Error())
+ 	}
+@@ -220,7 +230,7 @@ func Test_MultiNodeClusterQueuedRequestForwardOK(t *testing.T) {
+ 	}
+ 
+ 	// Write a request to a follower's queue, checking it's eventually sent to the leader.
+-	followers, err := c.Followers()
++	followers, err := c.Followers(ctx)
+ 	if err != nil {
+ 		t.Fatalf("failed to get followers: %s", err.Error())
+ 	}
+diff --git a/system_test/single_node_test.go b/system_test/single_node_test.go
+index 9b6309d..0afe3fe 100644
+--- a/system_test/single_node_test.go
++++ b/system_test/single_node_test.go
+@@ -4,6 +4,7 @@ Package system runs system-level testing of rqlite. This includes testing of sin
+ package system
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+@@ -15,7 +16,10 @@ import (
+ )
+ 
+ func Test_SingleNodeBasicEndpoint(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	// Ensure accessing endpoints in basic manner works
+@@ -28,7 +32,7 @@ func Test_SingleNodeBasicEndpoint(t *testing.T) {
+ 	mux, ln := mustNewOpenMux("")
+ 	defer ln.Close()
+ 	node = mustNodeEncryptedOnDisk(dir, true, false, mux, "", false)
+-	if _, err := node.WaitForLeader(); err != nil {
++	if _, err := node.WaitForLeader(ctx); err != nil {
+ 		t.Fatalf("node never became leader")
+ 	}
+ 	_, err = node.Status()
+@@ -58,7 +62,10 @@ func Test_SingleNodeNotReady(t *testing.T) {
+ }
+ 
+ func Test_SingleNode(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	tests := []struct {
+@@ -121,7 +128,10 @@ func Test_SingleNode(t *testing.T) {
+ }
+ 
+ func Test_SingleNodeMulti(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	tests := []struct {
+@@ -182,8 +192,11 @@ func Test_SingleNodeMulti(t *testing.T) {
+ }
+ 
+ func Test_SingleNodeConcurrentRequests(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	var err error
+-	node := mustNewLeaderNode()
++	node := mustNewLeaderNode(ctx)
+ 	node.Store.SetRequestCompression(1024, 1024) // Ensure no compression
+ 	defer node.Deprovision()
+ 
+@@ -215,8 +228,11 @@ func Test_SingleNodeConcurrentRequests(t *testing.T) {
+ }
+ 
+ func Test_SingleNodeConcurrentRequestsCompressed(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	var err error
+-	node := mustNewLeaderNode()
++	node := mustNewLeaderNode(ctx)
+ 	node.Store.SetRequestCompression(0, 0) // Ensure compression
+ 	defer node.Deprovision()
+ 
+@@ -248,7 +264,10 @@ func Test_SingleNodeConcurrentRequestsCompressed(t *testing.T) {
+ }
+ 
+ func Test_SingleNodeParameterized(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	tests := []struct {
+@@ -291,7 +310,10 @@ func Test_SingleNodeParameterized(t *testing.T) {
+ }
+ 
+ func Test_SingleNodeParameterizedNamed(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	tests := []struct {
+@@ -334,7 +356,10 @@ func Test_SingleNodeParameterizedNamed(t *testing.T) {
+ }
+ 
+ func Test_SingleNodeQueued(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	_, err := node.Execute(`CREATE TABLE foo (id integer not null primary key, name text)`)
+@@ -374,7 +399,10 @@ func Test_SingleNodeQueued(t *testing.T) {
+ // Test_SingleNodeSQLInjection demonstrates that using the non-parameterized API is vulnerable to
+ // SQL injection attacks.
+ func Test_SingleNodeSQLInjection(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	tests := []struct {
+@@ -429,7 +457,10 @@ func Test_SingleNodeSQLInjection(t *testing.T) {
+ // Test_SingleNodeNoSQLInjection demonstrates that using the parameterized API protects
+ // against SQL injection attacks.
+ func Test_SingleNodeNoSQLInjection(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	tests := []struct {
+@@ -477,6 +508,9 @@ func Test_SingleNodeNoSQLInjection(t *testing.T) {
+ }
+ 
+ func Test_SingleNodeRestart(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
+ 	// Deprovision of a node deletes the node's dir, so make a copy first.
+ 	srcdir := filepath.Join("testdata", "v6.0.0-data")
+ 	destdir := mustTempDir()
+@@ -492,7 +526,7 @@ func Test_SingleNodeRestart(t *testing.T) {
+ 
+ 	node := mustNodeEncrypted(destdir, true, false, mux, "node1")
+ 	defer node.Deprovision()
+-	if _, err := node.WaitForLeader(); err != nil {
++	if _, err := node.WaitForLeader(ctx); err != nil {
+ 		t.Fatal("node never became leader")
+ 	}
+ 
+@@ -520,7 +554,10 @@ func Test_SingleNodeRestart(t *testing.T) {
+ }
+ 
+ func Test_SingleNodeNodes(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	// Access endpoints to ensure the code is covered.
+@@ -551,7 +588,10 @@ func Test_SingleNodeNodes(t *testing.T) {
+ }
+ 
+ func Test_SingleNodeCoverage(t *testing.T) {
+-	node := mustNewLeaderNode()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	node := mustNewLeaderNode(ctx)
+ 	defer node.Deprovision()
+ 
+ 	// Access endpoints to ensure the code is covered.
+@@ -578,6 +618,8 @@ func Test_SingleNodeCoverage(t *testing.T) {
+ // Test_SingleNodeReopen tests that a node can be re-opened OK.
+ func Test_SingleNodeReopen(t *testing.T) {
+ 	onDisk := false
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
+ 
+ 	for {
+ 		t.Logf("running test %s, on-disk=%v", t.Name(), onDisk)
+@@ -587,7 +629,7 @@ func Test_SingleNodeReopen(t *testing.T) {
+ 		defer ln.Close()
+ 		node := mustNodeEncrypted(dir, true, false, mux, "")
+ 
+-		if _, err := node.WaitForLeader(); err != nil {
++		if _, err := node.WaitForLeader(ctx); err != nil {
+ 			t.Fatalf("node never became leader")
+ 		}
+ 
+@@ -595,7 +637,7 @@ func Test_SingleNodeReopen(t *testing.T) {
+ 			t.Fatalf("failed to close node")
+ 		}
+ 
+-		if err := node.Store.Open(); err != nil {
++		if err := node.Store.Open(ctx); err != nil {
+ 			t.Fatalf("failed to re-open store: %s", err)
+ 		}
+ 		if err := node.Store.Bootstrap(store.NewServer(node.Store.ID(), node.Store.Addr(), true)); err != nil {
+@@ -605,7 +647,7 @@ func Test_SingleNodeReopen(t *testing.T) {
+ 			t.Fatalf("failed to restart service: %s", err)
+ 		}
+ 
+-		if _, err := node.WaitForLeader(); err != nil {
++		if _, err := node.WaitForLeader(ctx); err != nil {
+ 			t.Fatalf("node never became leader")
+ 		}
+ 
+@@ -622,6 +664,8 @@ func Test_SingleNodeReopen(t *testing.T) {
+ // a non-database command in the log.
+ func Test_SingleNodeNoopReopen(t *testing.T) {
+ 	onDisk := false
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
+ 
+ 	for {
+ 		t.Logf("running test %s, on-disk=%v", t.Name(), onDisk)
+@@ -631,7 +675,7 @@ func Test_SingleNodeNoopReopen(t *testing.T) {
+ 		defer ln.Close()
+ 		node := mustNodeEncryptedOnDisk(dir, true, false, mux, "", false)
+ 
+-		if _, err := node.WaitForLeader(); err != nil {
++		if _, err := node.WaitForLeader(ctx); err != nil {
+ 			t.Fatalf("node never became leader")
+ 		}
+ 
+@@ -643,7 +687,7 @@ func Test_SingleNodeNoopReopen(t *testing.T) {
+ 			t.Fatalf("failed to close node")
+ 		}
+ 
+-		if err := node.Store.Open(); err != nil {
++		if err := node.Store.Open(ctx); err != nil {
+ 			t.Fatalf("failed to re-open store: %s", err)
+ 		}
+ 		if err := node.Store.Bootstrap(store.NewServer(node.Store.ID(), node.Store.Addr(), true)); err != nil {
+@@ -656,7 +700,7 @@ func Test_SingleNodeNoopReopen(t *testing.T) {
+ 		// again, so explicitly set the API address again.
+ 		node.APIAddr = node.Service.Addr().String()
+ 
+-		if _, err := node.WaitForLeader(); err != nil {
++		if _, err := node.WaitForLeader(ctx); err != nil {
+ 			t.Fatalf("node never became leader")
+ 		}
+ 
+@@ -714,6 +758,8 @@ func Test_SingleNodeNoopReopen(t *testing.T) {
+ // contain database data. This shouldn't happen in real systems
+ func Test_SingleNodeNoopSnapReopen(t *testing.T) {
+ 	onDisk := false
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
+ 
+ 	for {
+ 		t.Logf("running test %s, on-disk=%v", t.Name(), onDisk)
+@@ -723,7 +769,7 @@ func Test_SingleNodeNoopSnapReopen(t *testing.T) {
+ 		defer ln.Close()
+ 		node := mustNodeEncryptedOnDisk(dir, true, false, mux, "", onDisk)
+ 
+-		if _, err := node.WaitForLeader(); err != nil {
++		if _, err := node.WaitForLeader(ctx); err != nil {
+ 			t.Fatalf("node never became leader")
+ 		}
+ 
+@@ -740,7 +786,7 @@ func Test_SingleNodeNoopSnapReopen(t *testing.T) {
+ 			t.Fatalf("failed to close node")
+ 		}
+ 
+-		if err := node.Store.Open(); err != nil {
++		if err := node.Store.Open(ctx); err != nil {
+ 			t.Fatalf("failed to re-open store: %s", err)
+ 		}
+ 		if err := node.Store.Bootstrap(store.NewServer(node.Store.ID(), node.Store.Addr(), true)); err != nil {
+@@ -753,7 +799,7 @@ func Test_SingleNodeNoopSnapReopen(t *testing.T) {
+ 		// again, so explicitly set the API address again.
+ 		node.APIAddr = node.Service.Addr().String()
+ 
+-		if _, err := node.WaitForLeader(); err != nil {
++		if _, err := node.WaitForLeader(ctx); err != nil {
+ 			t.Fatalf("node never became leader")
+ 		}
+ 
+@@ -811,6 +857,8 @@ func Test_SingleNodeNoopSnapReopen(t *testing.T) {
+ func Test_SingleNodeNoopSnapLogsReopen(t *testing.T) {
+ 	onDisk := false
+ 	var raftAddr string
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
+ 
+ 	for {
+ 		t.Logf("running test %s, on-disk=%v", t.Name(), onDisk)
+@@ -822,7 +870,7 @@ func Test_SingleNodeNoopSnapLogsReopen(t *testing.T) {
+ 		raftAddr = node.RaftAddr
+ 		t.Logf("node listening for Raft on %s", raftAddr)
+ 
+-		if _, err := node.WaitForLeader(); err != nil {
++		if _, err := node.WaitForLeader(ctx); err != nil {
+ 			t.Fatalf("node never became leader")
+ 		}
+ 
+@@ -844,7 +892,7 @@ func Test_SingleNodeNoopSnapLogsReopen(t *testing.T) {
+ 			t.Fatalf("failed to close node")
+ 		}
+ 
+-		if err := node.Store.Open(); err != nil {
++		if err := node.Store.Open(ctx); err != nil {
+ 			t.Fatalf("failed to re-open store: %s", err)
+ 		}
+ 		if err := node.Service.Start(); err != nil {
+@@ -854,7 +902,7 @@ func Test_SingleNodeNoopSnapLogsReopen(t *testing.T) {
+ 		// again, so explicitly set the API address again.
+ 		node.APIAddr = node.Service.Addr().String()
+ 
+-		if _, err := node.WaitForLeader(); err != nil {
++		if _, err := node.WaitForLeader(ctx); err != nil {
+ 			t.Fatalf("node never became leader")
+ 		}
+ 
